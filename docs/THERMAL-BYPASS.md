@@ -95,7 +95,9 @@ unaffected.
 * The jar is **bind-mounted** over `/system/framework/oplus-framework.jar`; the
   file on disk is never modified.
 * The mount must happen **before the zygote starts** — it opens the bootclasspath
-  at boot. `post-fs-data` runs at ~6 s, the zygote starts at ~11.6 s → OK.
+  at boot. Measured on the Nord 3: the module's `post-fs-data.sh` runs at
+  **t = 10 s** and `init: starting service 'zygote'` happens at **t = 11.7 s**,
+  so the patched jar is the one the zygote loads.
 * The SELinux label is set **once, at install time**, copied from the original
   (`u:object_r:system_file:s0`). The zygote must be able to read the jar, or
   the phone boot-loops.
@@ -103,6 +105,20 @@ unaffected.
   `exit 0` — they can never fail a boot.
 * A sha256 guard makes the module refuse to mount on a different firmware
   (e.g. after an OTA).
+
+### How to check it is actually live
+
+The zygote holds the bootclasspath jar open — check *which* file, and follow
+the symlink (`stat -L`, otherwise you stat the `/proc/.../fd/N` link itself
+and get a meaningless inode):
+
+```bash
+z=$(pidof zygote64 | cut -d' ' -f1)
+fd=$(ls -l /proc/$z/fd | grep oplus-framework.jar | head -1 | awk '{print $8}')
+stat -Lc '%d:%i' /proc/$z/fd/$fd          # what the zygote has open
+stat -Lc '%d:%i' /data/adb/modules/ocam_thermalfix/PATCHED-ofw.jar
+# both must be identical -> the patched jar is the one in memory
+```
 
 ## Install
 
@@ -152,6 +168,21 @@ Rollback:
 | Dex magic / size / adler32 / sha1 | ✅ valid for both dex files |
 | Bind mount + SELinux label | ✅ mounted, `system_file` |
 | System health with the mount active | ✅ camera launches, HAL receives `isCapture(1)` |
+| Mount precedes the zygote | ✅ `post-fs-data` at t=10 s, zygote at t=11.7 s |
+| Zygote holds the patched jar | ✅ identical `device:inode` to `PATCHED-ofw.jar` |
+
+### Measured result on the Nord 3
+
+| | before | after |
+|---|---|---|
+| Tap → photo on disk | 3.2 – 6.3 s | **0.89 s** |
+| skin / horae temperature at the time | 44 – 49 °C / 43 – 45 °C | 49 °C / **45.4 °C** |
+| camera crashes | 0 | 0 |
+
+The "after" shot was taken while the phone was **4.4 °C above** the camera's
+own 41 °C threshold — i.e. the deferral no longer triggers even when the
+device is hot. Both numbers come from the same scene and the same lighting on
+the same phone (the AE/exposure values in the logcat are identical).
 
 ## Relationship to the SDK patch
 
