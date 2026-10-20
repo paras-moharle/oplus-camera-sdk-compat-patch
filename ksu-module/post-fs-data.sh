@@ -34,17 +34,29 @@
 
 MODDIR=/data/adb/modules/ocam_sdkfix
 SRC="$MODDIR/SDK-PATCHED.jar"
+SIZE_FILE="$MODDIR/SDK-PATCHED.jar.size"
 TGT=/product/framework/com.oplus.camera.unit.sdk.jar
-
-# expected size of the patched jar - guards against a truncated/partial file
-EXPECT=4946460
 
 [ -f "$SRC" ] || exit 0
 
-# make sure the source is a complete file and carries a readable label
+# Sanity-check the jar so a truncated / partially written file can never be
+# mounted over the real SDK.  install.sh records the exact byte count next to
+# the jar; if that file is missing (hand-made module zip) fall back to a
+# structural check so the module also works on devices whose SDK jar has a
+# different size.
 SZ=$(stat -c %s "$SRC" 2>/dev/null)
 [ -n "$SZ" ] || exit 0
-[ "$SZ" = "$EXPECT" ] || exit 0
+if [ -f "$SIZE_FILE" ]; then
+  EXPECT=$(cat "$SIZE_FILE" 2>/dev/null)
+  [ -n "$EXPECT" ] || exit 0
+  [ "$SZ" = "$EXPECT" ] || exit 0
+else
+  [ "$SZ" -ge 1000000 ] || exit 0
+  case "$(head -c 2 "$SRC" 2>/dev/null)" in
+    PK) ;;
+    *) exit 0 ;;
+  esac
+fi
 
 # already mounted?  then nothing to do
 if mount | grep -q " on $TGT "; then

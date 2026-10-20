@@ -11,13 +11,23 @@
 
 MODDIR=/data/adb/modules/ocam_sdkfix
 SRC="$MODDIR/SDK-PATCHED.jar"
+SIZE_FILE="$MODDIR/SDK-PATCHED.jar.size"
 TGT=/product/framework/com.oplus.camera.unit.sdk.jar
-EXPECT=4946460
 
 [ -f "$SRC" ] || exit 0
 SZ=$(stat -c %s "$SRC" 2>/dev/null)
 [ -n "$SZ" ] || exit 0
-[ "$SZ" = "$EXPECT" ] || exit 0
+if [ -f "$SIZE_FILE" ]; then
+  EXPECT=$(cat "$SIZE_FILE" 2>/dev/null)
+  [ -n "$EXPECT" ] || exit 0
+  [ "$SZ" = "$EXPECT" ] || exit 0
+else
+  [ "$SZ" -ge 1000000 ] || exit 0
+  case "$(head -c 2 "$SRC" 2>/dev/null)" in
+    PK) ;;
+    *) exit 0 ;;
+  esac
+fi
 
 if mount | grep -q " on $TGT "; then
   exit 0

@@ -145,6 +145,11 @@ drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-PATCHED.jar" 2>/dev/null || t
 drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-ORIGINAL.jar" 2>/dev/null || true
 say "label set (install time only, never at boot)"
 
+# Record the exact size of the patched jar.  The boot scripts compare it
+# against the file before bind-mounting it, so a truncated / partially written
+# jar can never shadow the real SDK.
+drun "stat -c %s $KSU_DIR/SDK-PATCHED.jar > $KSU_DIR/SDK-PATCHED.jar.size"
+
 adb push "$SCRIPT_DIR/ksu-module/module.prop"     "$KSU_DIR/module.prop.tmp"     >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/post-fs-data.sh" "$KSU_DIR/post-fs-data.sh.tmp" >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/service.sh"      "$KSU_DIR/service.sh.tmp"      >/dev/null

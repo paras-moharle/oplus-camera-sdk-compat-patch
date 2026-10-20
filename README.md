@@ -39,7 +39,7 @@ Full write-up: **[docs/ROOT-CAUSE.md](docs/ROOT-CAUSE.md)**.
 
 ## Install (easiest: KernelSU module)
 
-1. Download **`ocam_sdkfix-v1.0.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
+1. Download the latest **`ocam_sdkfix-v1.1.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
 2. KernelSU Manager → **Modules** → **Install from storage** → pick the zip → reboot.
 3. Open the camera and take a photo.
 
@@ -218,6 +218,7 @@ tools/
   patch_sdk.py               applies the fix to a decoded smali tree
   dexfp.py                   dex reader: inventory / fingerprint / compare
   analyze_sdk_skew.py        finds API skew between an APK and the device SDK
+  build_release.sh           packages the flashable module zip
 docs/
   ROOT-CAUSE.md              the full investigation
   COMPATIBILITY.md           device / firmware matrix
