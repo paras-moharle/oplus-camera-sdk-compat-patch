@@ -73,17 +73,24 @@ mkdir -p "$WORKDIR"
 say "workdir: $WORKDIR"
 
 # --------------------------------------------------------- pull + decode
+# If the patch is already active the target path is a bind mount over the
+# patched jar.  We must work on the PRISTINE file, so unmount first.
+if mount | grep -q " on $DEVICE_JAR "; then
+  say "unmounting the active patch overlay (the patch is inactive until we re-apply it)"
+  drun "umount $DEVICE_JAR" 2>/dev/null || true
+fi
+
 say "pulling device SDK jar"
 adb pull "$DEVICE_JAR" "$WORKDIR/sdk-original.jar" >/dev/null
 [ -s "$WORKDIR/sdk-original.jar" ] || die "failed to pull $DEVICE_JAR"
 
-say "backing up original jar to device"
+say "backing up the pristine original jar to the device"
 BACKUP="/data/local/tmp/ocam-sdk-ORIGINAL.jar"
 if [ "$FORCE" -eq 0 ] && drun "test -f $BACKUP" | grep -q .; then
   warn "$BACKUP exists, keeping the existing backup"
 else
   drun "cp $DEVICE_JAR $BACKUP"
-  say "backup saved at $BACKUP"
+  say "backup saved at $BACKUP ($(stat -c%s "$WORKDIR/sdk-original.jar") bytes)"
 fi
 
 say "decoding with apktool"
@@ -126,13 +133,12 @@ drun "mkdir -p $KSU_DIR"
 adb push "$WORKDIR/sdk-patched.jar" "$KSU_DIR.tmp" >/dev/null
 drun "cp $KSU_DIR.tmp $KSU_DIR/SDK-PATCHED.jar && rm -f $KSU_DIR.tmp"
 drun "cp $BACKUP $KSU_DIR/SDK-ORIGINAL.jar"
+# DAC permissions only.  NEVER chcon here or in post-fs-data.sh: MediaTek's
+# MKP kernel-integrity module panics the kernel (-> boot loop) when the
+# SELinux state changes at boot.  The module directory keeps its normal
+# "adb_data_file" label, which the camera app and the camera HAL can read.
 drun "chown root:root $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
-drun "chmod 644 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
-# The bind mount replaces the file at the target path; the SELinux label of the
-# SOURCE file is what the app will see, so it must stay system_file or the
-# camera app (untrusted_app) cannot read it -> NoClassDefFoundError.
-drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-PATCHED.jar" || \
-     warn "chcon failed - if the camera fails to start, run: chcon u:object_r:system_file:s0 $KSU_DIR/SDK-PATCHED.jar"
+drun "chmod 755 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
 
 adb push "$SCRIPT_DIR/ksu-module/module.prop"    "$KSU_DIR/module.prop.tmp"    >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/post-fs-data.sh" "$KSU_DIR/post-fs-data.sh.tmp" >/dev/null
@@ -143,21 +149,25 @@ drun "chmod 755 $KSU_DIR/post-fs-data.sh"
 say "module installed:"
 drun "ls -l $KSU_DIR" | sed 's/^/  /'
 
+# Apply the patch immediately so the user does not have to wait for a reboot.
+# The module will re-apply it at every subsequent boot.
+say "applying the patch now (the module re-applies it at every boot)"
+if drun "mount --bind $KSU_DIR/SDK-PATCHED.jar $DEVICE_JAR" 2>/dev/null; then
+  say "patch is live - no reboot strictly required"
+else
+  warn "could not apply the bind mount now, a reboot is required"
+fi
+
 cat <<EOF
 
 $(printf '\033[1;32m*** DONE ***\033[0m')
 
-The patched SDK is installed but only takes effect after a reboot
-(the module bind-mounts it at boot).
+The patched SDK is installed.
 
-  reboot now?      ->  ./install.sh --force   (it reboots)  or just:  adb reboot
+  verify:  adb shell mount | grep camera.unit.sdk
+  rollback: ./uninstall.sh
 
-After rebooting, verify with:
-  adb shell mount | grep camera.unit.sdk     # should show the patched size
-  open the camera, press the shutter, check a new JPG appears in /sdcard/DCIM/Camera
-
-Rollback at any time:
-  ./uninstall.sh
+A reboot is recommended so that every process picks up the patched jar.
 EOF
 
 if [ "$REBOOT" -eq 1 ]; then

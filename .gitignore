@@ -19,3 +19,6 @@ ksu-module/SDK-ORIGINAL.jar
 .vscode/
 __pycache__/
 *.pyc
+
+# release artefacts (built from the target device's own SDK jar)
+release/
