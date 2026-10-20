@@ -75,6 +75,18 @@ adb shell ls -lt /sdcard/DCIM/Camera/ | head -3
 > The original file on disk is **never modified** — the patch is a bind mount.
 > `sha256sum /product/framework/com.oplus.camera.unit.sdk.jar` still shows the
 > pristine OEM hash after installing.
+>
+> If your device has a KernelSU **metamodule with a custom installer** active,
+> it blocks `ksud module install` ("Metamodule installation blocked"). Use
+> `./install.sh`, which writes the module directory directly, or install the
+> release zip once the metamodule is disabled.
+>
+> If the module is ever removed by a bootloop-saver, re-apply the patch
+> without rebooting:
+> ```bash
+> adb shell su -c sh /data/local/tmp/ocam-apply.sh
+> ```
+
 
 ---
 
@@ -180,9 +192,15 @@ Full matrix: **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 
 | Never do this | Why |
 |---|---|
-| `setenforce 0` (permissive SELinux) | MediaTek's **MKP** integrity module panics the kernel and kills `system_server` → black screen, reboot loop |
+| `setenforce 0` (permissive SELinux) | MediaTek's **MKP** integrity module hashes the SELinux state and panics the kernel → black screen, reboot loop. This is what caused the very first crash in this investigation. |
 | Run frida / frida-server | it writes an SELinux policy to the kernel → same MKP panic |
-| Bind-mount over `/product/...` without fixing the label | the app can't read the jar → `NoClassDefFoundError`, black preview. The module `chcon`s the source to `system_file` for exactly this reason |
+| `chcon` / `setfattr` / `setenforce` from a **boot-time** script | same MKP panic. **This module therefore sets the SELinux label exactly once, at install time**, and its boot scripts do nothing but `mount --bind`. |
+| Bind-mount over `/product/...` with the wrong label | the camera app cannot read the jar → `NoClassDefFoundError`, instant crash. The jar keeps the `system_file` label the original had. |
+
+> Note: on this device MKP also panics continuously from unrelated modules
+> (`zygisk_vector`, `rezygisk`, …). If `dmesg | grep policy_action_panic` is
+> already counting up while the patch is disabled, that is **not** the patch.
+
 
 ---
 

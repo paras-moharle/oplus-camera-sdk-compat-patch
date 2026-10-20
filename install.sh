@@ -133,18 +133,25 @@ drun "mkdir -p $KSU_DIR"
 adb push "$WORKDIR/sdk-patched.jar" "$KSU_DIR.tmp" >/dev/null
 drun "cp $KSU_DIR.tmp $KSU_DIR/SDK-PATCHED.jar && rm -f $KSU_DIR.tmp"
 drun "cp $BACKUP $KSU_DIR/SDK-ORIGINAL.jar"
-# DAC permissions only.  NEVER chcon here or in post-fs-data.sh: MediaTek's
-# MKP kernel-integrity module panics the kernel (-> boot loop) when the
-# SELinux state changes at boot.  The module directory keeps its normal
-# "adb_data_file" label, which the camera app and the camera HAL can read.
+# DAC permissions only.
 drun "chown root:root $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
 drun "chmod 755 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
+# The SELinux label is set ONCE, here at install time - never from a boot-time
+# script.  MediaTek's MKP kernel-integrity module hashes the SELinux state and
+# panics the kernel (kernel panic, boot loop) when a label changes while the
+# system is booting.  The camera app and the camera HAL can only read the jar
+# if it carries the same label the original had, hence system_file.
+drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-PATCHED.jar" 2>/dev/null || true
+drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-ORIGINAL.jar" 2>/dev/null || true
+say "label set (install time only, never at boot)"
 
-adb push "$SCRIPT_DIR/ksu-module/module.prop"    "$KSU_DIR/module.prop.tmp"    >/dev/null
+adb push "$SCRIPT_DIR/ksu-module/module.prop"     "$KSU_DIR/module.prop.tmp"     >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/post-fs-data.sh" "$KSU_DIR/post-fs-data.sh.tmp" >/dev/null
+adb push "$SCRIPT_DIR/ksu-module/service.sh"      "$KSU_DIR/service.sh.tmp"      >/dev/null
 drun "mv $KSU_DIR/module.prop.tmp $KSU_DIR/module.prop"
 drun "mv $KSU_DIR/post-fs-data.sh.tmp $KSU_DIR/post-fs-data.sh"
-drun "chmod 755 $KSU_DIR/post-fs-data.sh"
+drun "mv $KSU_DIR/service.sh.tmp $KSU_DIR/service.sh"
+drun "chmod 755 $KSU_DIR/post-fs-data.sh $KSU_DIR/service.sh"
 
 say "module installed:"
 drun "ls -l $KSU_DIR" | sed 's/^/  /'
