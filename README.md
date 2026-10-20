@@ -37,6 +37,32 @@ Full write-up: **[docs/ROOT-CAUSE.md](docs/ROOT-CAUSE.md)**.
 
 ---
 
+## Optional: the 3–6 second shutter
+
+**Symptom:** photos *do* arrive, but **3–6 seconds** after you press the
+shutter; the preview stutters; video recording is refused when the phone is
+warm. It affects the **stock camera too**, and it is present on a **stock
+ROM** — it has nothing to do with root.
+
+**Cause:** both camera builds hard-code `common_capture_temperature_threshold
+= "41"` and compare it against the skin temperature reported by Oplus' *horae*
+service (`dumpsys horae` → `Temp: 41.53`). A phone that idles at 40–44 °C is
+*permanently* over that threshold, so the camera's capture-defer logic never
+lets go. The threshold cannot be changed by configuration (the OEM code has a
+key/lookup type mismatch that always falls back to the hard-coded value).
+
+**Fix:** patch `oplus-framework.jar` so that **only the camera process** sees a
+capped temperature. Every other app keeps the real one.
+
+```bash
+./install.sh --with-thermal-fix     # SDK patch + thermal bypass
+./install_thermalfix.sh             # thermal bypass only
+```
+
+Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
+
+---
+
 ## Install (easiest: KernelSU module)
 
 1. Download the latest **`ocam_sdkfix-v1.2.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
@@ -230,18 +256,28 @@ bash tools/test_boot_guards.sh ksu-module/service.sh
 README.md                    this file
 LICENSE                      MIT
 install.sh                   patch + install + reboot      (device side)
-uninstall.sh                 rollback                      (device side)
+install_thermalfix.sh        optional: camera thermal bypass (device side)
+uninstall.sh                 rollback  (--thermal also removes the bypass)
 ksu-module/
   module.prop                KernelSU module metadata
   post-fs-data.sh            boot-time bind mount
+  service.sh                 late-start fallback
+ksu-module-thermal/
+  module.prop                KernelSU module metadata (optional module)
+  post-fs-data.sh            boot-time bind mount of the framework jar
+  service.sh                 late-start fallback
 tools/
   patch_sdk.py               applies the fix to a decoded smali tree
   dexfp.py                   dex reader: inventory / fingerprint / compare
   analyze_sdk_skew.py        finds API skew between an APK and the device SDK
   build_release.sh           packages the flashable module zip
+  build_thermalfix_zip.sh    packages the optional thermal module zip
+  build_framework_patch.sh   decode + patch + rebuild + verify the framework jar
+  patch_thermal_bypass.py    patches the camera-only thermal bypass
   test_boot_guards.sh        simulates the boot-script safety guards
 docs/
   ROOT-CAUSE.md              the full investigation
+  THERMAL-BYPASS.md          the optional 3-6 s shutter fix
   COMPATIBILITY.md           device / firmware matrix
 ```
 

@@ -17,9 +17,11 @@
 # the stock behaviour instantly.
 #
 # Usage:
-#   ./install.sh                 # install + reboot
-#   ./install.sh --no-reboot     # install, reboot yourself later
-#   ./install.sh --force         # allow overwriting an existing install
+#   ./install.sh                    # install + reboot
+#   ./install.sh --no-reboot        # install, reboot yourself later
+#   ./install.sh --force            # allow overwriting an existing install
+#   ./install.sh --with-thermal-fix # ALSO install the optional camera thermal
+#                                   # bypass (see docs/THERMAL-BYPASS.md)
 #
 set -euo pipefail
 
@@ -32,11 +34,13 @@ WORKDIR="${WORKDIR:-$(mktemp -d /tmp/ocam-patch-XXXXXX)}"
 
 FORCE=0
 REBOOT=1
+THERMAL=0
 for a in "$@"; do
   case "$a" in
     --force) FORCE=1 ;;
     --no-reboot) REBOOT=0 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --with-thermal-fix) THERMAL=1 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -186,6 +190,13 @@ The patched SDK is installed.
 
 A reboot is recommended so that every process picks up the patched jar.
 EOF
+
+if [ "$THERMAL" -eq 1 ]; then
+  say
+  say "installing the optional camera thermal bypass as well"
+  # never reboot from here - install.sh does the single reboot at the end
+  "$SCRIPT_DIR/install_thermalfix.sh" --no-reboot
+fi
 
 if [ "$REBOOT" -eq 1 ]; then
   say "rebooting"

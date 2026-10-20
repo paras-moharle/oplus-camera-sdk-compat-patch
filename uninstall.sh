@@ -6,16 +6,24 @@
 # The patch is only ever a bind mount, so removing the module and rebooting
 # restores the original jar exactly - the file on disk was never modified.
 #
+# Usage:
+#   ./uninstall.sh              # remove the SDK patch
+#   ./uninstall.sh --thermal    # also remove the optional camera thermal bypass
+#
 set -euo pipefail
 
 KSU_DIR="/data/adb/modules/ocam_sdkfix"
+THERMAL_DIR="/data/adb/modules/ocam_thermalfix"
 TARGET="/product/framework/com.oplus.camera.unit.sdk.jar"
+FW_TARGET="/system/framework/oplus-framework.jar"
 REBOOT=1
+THERMAL=0
 
 for a in "$@"; do
   case "$a" in
     --no-reboot) REBOOT=0 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --thermal) THERMAL=1 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -37,6 +45,16 @@ drun "umount $TARGET" 2>/dev/null || true
 
 say "removing KernelSU module $KSU_DIR"
 drun "rm -rf $KSU_DIR"
+
+if [ "$THERMAL" -eq 1 ]; then
+  say "unmounting the camera thermal bypass overlay"
+  drun "umount $FW_TARGET" 2>/dev/null || true
+  say "removing KernelSU module $THERMAL_DIR"
+  drun "rm -rf $THERMAL_DIR"
+  say "confirming the stock framework jar is back in place"
+  drun "ls -l $FW_TARGET" | sed 's/^/  /'
+  drun "sha256sum $FW_TARGET" 2>/dev/null | sed 's/^/  /' || true
+fi
 
 say "confirming the stock jar is back in place"
 drun "ls -l $TARGET" | sed 's/^/  /'
