@@ -1,0 +1,6 @@
+id=ocam_sdkfix
+name=Oplus CameraUnit SDK compat patch
+version=v1.0
+versionCode=1
+author=Paras Moharle
+description=Patches /product/framework/com.oplus.camera.unit.sdk.jar so that the "com.oplus.picture.exif.flag" capture parameter accepts long[] as well as int[]. Required by Oplus Camera 6.070.215+ on firmware that still ships the 6.020.980-era CameraUnit SDK. The patch is applied as a bind mount, the original file on disk is never modified. Disable this module after a ColorOS OTA.

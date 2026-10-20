@@ -1,0 +1,21 @@
+# build / patch artefacts
+work/
+build/
+dist/
+*.jar
+*.apk
+*.dex
+sdk/
+sdk-*/
+
+# the patched SDK jar is built on the target device, never committed
+ksu-module/SDK-PATCHED.jar
+ksu-module/SDK-ORIGINAL.jar
+
+# local scratch
+*.log
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.pyc
