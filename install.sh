@@ -140,10 +140,15 @@ drun "chmod 755 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
 # script.  MediaTek's MKP kernel-integrity module hashes the SELinux state and
 # panics the kernel (kernel panic, boot loop) when a label changes while the
 # system is booting.  The camera app and the camera HAL can only read the jar
-# if it carries the same label the original had, hence system_file.
-drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-PATCHED.jar" 2>/dev/null || true
-drun "chcon u:object_r:system_file:s0 $KSU_DIR/SDK-ORIGINAL.jar" 2>/dev/null || true
-say "label set (install time only, never at boot)"
+# if it carries the same label the original had.
+#
+# Read that label from the device instead of hardcoding it - it is not the
+# same on every firmware version.
+ORIG_CTX=$(drun "ls -Z $DEVICE_JAR" 2>/dev/null | awk '{print $1}')
+[ -n "$ORIG_CTX" ] || ORIG_CTX="u:object_r:system_file:s0"
+drun "chcon $ORIG_CTX $KSU_DIR/SDK-PATCHED.jar" 2>/dev/null || true
+drun "chcon $ORIG_CTX $KSU_DIR/SDK-ORIGINAL.jar" 2>/dev/null || true
+say "label set to $ORIG_CTX (install time only, never at boot)"
 
 # Record the exact size of the patched jar.  The boot scripts compare it
 # against the file before bind-mounting it, so a truncated / partially written

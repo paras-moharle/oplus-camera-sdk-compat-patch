@@ -28,22 +28,27 @@
 #   anything SELinux-related changes while the system is booting.
 #   The SELinux label of the jar is therefore set ONCE, at install time, by
 #   install.sh - never from a boot-time script.
+# * Three guards decide whether the mount happens at all:
+#     1. the patched jar must be complete (recorded size, or zip magic),
+#     2. the SDK on disk must be byte-identical to the SDK this patched jar
+#        was built from  ->  the module cannot shadow a different firmware,
+#     3. nothing else on the device is touched.
 # * Every failure path exits 0.  This script can never fail a boot.
-# * Nothing outside /data/adb/modules/ocam_sdkfix and the single bind mount
-#   is touched.
 
 MODDIR=/data/adb/modules/ocam_sdkfix
 SRC="$MODDIR/SDK-PATCHED.jar"
+REF="$MODDIR/SDK-ORIGINAL.jar"
 SIZE_FILE="$MODDIR/SDK-PATCHED.jar.size"
 TGT=/product/framework/com.oplus.camera.unit.sdk.jar
 
 [ -f "$SRC" ] || exit 0
 
-# Sanity-check the jar so a truncated / partially written file can never be
-# mounted over the real SDK.  install.sh records the exact byte count next to
-# the jar; if that file is missing (hand-made module zip) fall back to a
-# structural check so the module also works on devices whose SDK jar has a
-# different size.
+# already mounted?  then there is nothing to do
+if awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$TGT"; then
+  exit 0
+fi
+
+# --- guard 1: the patched jar must be a complete file --------------------
 SZ=$(stat -c %s "$SRC" 2>/dev/null)
 [ -n "$SZ" ] || exit 0
 if [ -f "$SIZE_FILE" ]; then
@@ -58,11 +63,22 @@ else
   esac
 fi
 
-# already mounted?  then nothing to do
-if mount | grep -q " on $TGT "; then
+# --- guard 2: the SDK on disk must be the one this jar was built from ----
+# Without this the release zip (which carries a jar built on one specific
+# device) could be flashed onto a device with different firmware and would
+# silently replace that device's SDK with an incompatible one.  After an OTA
+# the SDK changes, this guard trips, and the module steps aside on its own.
+[ -f "$REF" ] || exit 0
+A=$(sha256sum "$TGT" 2>/dev/null | cut -d' ' -f1)
+B=$(sha256sum "$REF" 2>/dev/null | cut -d' ' -f1)
+[ -n "$A" ] || exit 0
+[ -n "$B" ] || exit 0
+if [ "$A" != "$B" ]; then
+  log -t ocam_sdkfix "SDK on disk does not match this module (OTA or different firmware) - not mounting" 2>/dev/null || true
   exit 0
 fi
 
+# --- mount ---------------------------------------------------------------
 mount --bind "$SRC" "$TGT" 2>/dev/null
 
 exit 0

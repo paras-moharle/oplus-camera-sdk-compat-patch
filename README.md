@@ -39,7 +39,7 @@ Full write-up: **[docs/ROOT-CAUSE.md](docs/ROOT-CAUSE.md)**.
 
 ## Install (easiest: KernelSU module)
 
-1. Download the latest **`ocam_sdkfix-v1.1.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
+1. Download the latest **`ocam_sdkfix-v1.2.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
 2. KernelSU Manager → **Modules** → **Install from storage** → pick the zip → reboot.
 3. Open the camera and take a photo.
 
@@ -152,7 +152,8 @@ dark env, flash-open trigger, lens-bag enable).
 | **Patch is hardware dependent?** | **No.** It is a Java type contract between two *firmware* components. No HAL, ISP, sensor or tuning data is touched. |
 | **Needs a matching camera APK?** | Yes — camera **6.070.215 or newer** against a **6.020.980-era** SDK. Both sides of that equation are firmware, not silicon. |
 | **Detection** | `grep -A6 KEY_PICTURE_EXIF_FLAG` in the decoded `producer/mode/BaseMode.smali` — if you see `check-cast v1, [I` right after the read, you need this. |
-| **After a ColorOS OTA** | **Disable the module.** An OTA ships a newer SDK and the mount would shadow it with this older build. |
+| **Flashed on a *different* device?** | The module **verifies** that the SDK on disk is byte-identical to the SDK its jar was built from. On a different firmware it refuses to mount — your camera stays broken rather than getting an incompatible SDK. Use `./install.sh` instead: it rebuilds the patch from *that* device's own SDK. |
+| **After a ColorOS OTA** | **Disable the module.** An OTA ships a newer SDK. v1.2+ detects this automatically (the SDK hash no longer matches) and steps aside on its own. |
 
 ---
 
@@ -201,6 +202,25 @@ Full matrix: **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 > (`zygisk_vector`, `rezygisk`, …). If `dmesg | grep policy_action_panic` is
 > already counting up while the patch is disabled, that is **not** the patch.
 
+### The module's own safety rails
+
+The boot scripts are deliberately paranoid — they only ever do a `mount --bind`,
+and only when everything checks out:
+
+| Guard | What it prevents |
+|---|---|
+| the patched jar must be complete (recorded size, or zip magic) | mounting a truncated / half-written file over the real SDK |
+| the SDK on disk must be byte-identical (sha256) to the copy the jar was built from | flashing the release zip onto a device with different firmware, or an OTA silently replacing a newer SDK with an older one |
+| already-mounted check (via `/proc/self/mountinfo`) | stacking mounts |
+| every path exits 0 | the module can never fail a boot |
+
+`tools/test_boot_guards.sh` runs these guards against a simulated filesystem:
+
+```bash
+bash tools/test_boot_guards.sh ksu-module/post-fs-data.sh
+bash tools/test_boot_guards.sh ksu-module/service.sh
+```
+
 
 ---
 
@@ -219,6 +239,7 @@ tools/
   dexfp.py                   dex reader: inventory / fingerprint / compare
   analyze_sdk_skew.py        finds API skew between an APK and the device SDK
   build_release.sh           packages the flashable module zip
+  test_boot_guards.sh        simulates the boot-script safety guards
 docs/
   ROOT-CAUSE.md              the full investigation
   COMPATIBILITY.md           device / firmware matrix
