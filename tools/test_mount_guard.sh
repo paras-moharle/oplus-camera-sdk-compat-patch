@@ -131,6 +131,15 @@ for f in "$REPO_DIR/ksu-module/service.sh"; do
   fi
 done
 
+say "the module must have a hard cap on the mounts it may create"
+for f in "$REPO_DIR/ksu-module/service.sh" "$REPO_DIR/ksu-module/post-fs-data.sh"; do
+  if grep -q "MOUNT_CAP" "$f"; then
+    ok "$(basename "$f") has a mount cap"
+  else
+    bad "$(basename "$f") has no mount cap"
+  fi
+done
+
 say "no raw mount may survive outside bind_once()"
 for f in "$REPO_DIR/ksu-module/post-fs-data.sh" "$REPO_DIR/ksu-module/service.sh"; do
   if python3 - "$f" <<'PYEOF'

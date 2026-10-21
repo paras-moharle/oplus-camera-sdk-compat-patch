@@ -41,6 +41,8 @@ SDK_SRC="$MODDIR/SDK-PATCHED.jar"
 SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
 OAT_DIR=/product/framework/oat/arm64
 DEX_CACHE=/data/dalvik-cache/arm64/product@framework@com.oplus.camera.unit.sdk.jar
+PF="$MODDIR/pf"
+PF_JAR="$PF/com.oplus.camera.unit.sdk.jar"
 PROP=persist.oplus.camera.thermal_bypass
 
 [ -f "$SDK_SRC" ] || exit 0
@@ -55,6 +57,23 @@ fi
 # compiled code.
 [ -f "$MODDIR/empty.bin" ] || : > "$MODDIR/empty.bin" 2>/dev/null
 
+# make sure the replacement directory for /product/framework exists and holds
+# the patched jar and no prebuilt artifacts.  /product/framework is an
+# OverlayFS, and ART opens the SDK jar through it - the overlay pins the
+# dentry, so a bind mount over the jar is ignored.  Replacing the whole
+# overlay with a plain directory is the only thing that works.
+build_pf_dir() {
+  if [ ! -f "$PF_JAR" ]; then
+    rm -rf "$PF" 2>/dev/null
+    mkdir -p "$PF" 2>/dev/null
+    cp -a /product/framework/. "$PF/" 2>/dev/null
+  fi
+  cp -f "$SDK_SRC" "$PF_JAR" 2>/dev/null
+  for f in "$PF/oat/arm64/com.oplus.camera.unit.sdk.vdex" "$PF/oat/arm64/com.oplus.camera.unit.sdk.odex"; do
+    [ -e "$f" ] && : > "$f" 2>/dev/null
+  done
+}
+
 # bind_once <source> <target> [namespace]
 #
 # NEVER stack a mount.  A mount on a path that is already mounted creates a
@@ -62,17 +81,30 @@ fi
 # until the kernel gives up - which is exactly what crashed the phone once.
 # So the target is always checked first, in the namespace it is going to be
 # created in.
+MOUNTS_MADE=0
+MOUNT_CAP=16
+
 bind_once() {
   SRC="$1"; TGT="$2"; NS="$3"
   [ -e "$TGT" ] || return 0
+
+  # Hard cap.  The module may create a handful of mounts, never more.  If the
+  # counter goes over the cap something is looping, and the module takes
+  # itself out of the game instead of filling the mount table.
+  if [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ]; then
+    say "ABORT: the mount cap ($MOUNT_CAP) is reached - disabling the module"
+    touch "$MODDIR/disable" 2>/dev/null
+    exit 0
+  fi
+
   if [ -n "$NS" ]; then
     nsenter -t "$NS" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
       | grep -qx "$TGT" && return 0
-    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
   else
     awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
       | grep -qx "$TGT" && return 0
-    mount --bind "$SRC" "$TGT" 2>/dev/null
+    mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
   fi
 }
 
@@ -312,6 +344,8 @@ while true; do
   if [ -n "$Z" ]; then
     if [ "$Z" != "$LAST_Z" ]; then
       LAST_Z="$Z"
+      build_pf_dir
+      bind_once "$PF" /product/framework "$Z"
       bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
       mask_prebuilt "$Z"
       clear_dex_cache
@@ -332,12 +366,15 @@ while true; do
   fi
 
   # --- init namespace (in case it was lost) ------------------------------
+  build_pf_dir
+  bind_once "$PF" /product/framework ""
   bind_once "$SDK_SRC" "$SDK_TGT" ""
   mask_prebuilt ""
 
   # --- the camera app's own namespace (cosmetic) -------------------------
   PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
   if [ -n "$PID" ] && [ "$PID" != "$LAST_PID" ]; then
+    bind_once "$PF" /product/framework "$PID"
     bind_once "$SDK_SRC" "$SDK_TGT" "$PID"
     mask_prebuilt "$PID"
     LAST_PID="$PID"

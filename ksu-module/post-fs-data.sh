@@ -88,17 +88,28 @@ SDK_SZ=$(stat -c %s "$SDK_SRC" 2>/dev/null)
 # mount on top of it, and doing that in a loop fills the mount table until
 # the kernel gives up (this crashed the phone once).  The target is always
 # checked first, in the namespace the mount is going to be created in.
+MOUNTS_MADE=0
+MOUNT_CAP=16
+
 bind_once() {
   SRC="$1"; TGT="$2"; NS="$3"
   [ -e "$TGT" ] || return 0
+
+  # Hard cap: the module may create a handful of mounts, never more.  If the
+  # counter goes over the cap something is looping, and the module steps
+  # itself out of the game instead of filling the mount table.
+  if [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ]; then
+    return 0
+  fi
+
   if [ -n "$NS" ]; then
     nsenter -t "$NS" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
       | grep -qx "$TGT" && return 0
-    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
   else
     awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
       | grep -qx "$TGT" && return 0
-    mount --bind "$SRC" "$TGT" 2>/dev/null
+    mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
   fi
 }
 
@@ -125,6 +136,42 @@ rm -f "$DEX_CACHE"@classes.dex 2>/dev/null
 # unpatched SDK and every capture is cancelled.  The mount has to be in place
 # BEFORE the app process starts, which means before the zygote forks it.
 #
+# ---------------------------------------------------------------------------
+# The replacement directory for /product/framework
+#
+# /product/framework is an OverlayFS on a read-only erofs partition, and ART
+# opens the CameraUnit SDK jar *through* that overlay.  Two things then defeat
+# any bind mount:
+#
+#   1. the OEM ships prebuilt dexopt artifacts for the jar
+#      (oat/arm64/com.oplus.camera.unit.sdk.odex / .vdex) that were compiled
+#      from the STOCK code - ART uses them and never reads the jar
+#   2. the overlay pins the dentry: a mount over the merged path (or over the
+#      lowerdir path) is visible to a plain path lookup, but ART's open goes
+#      through the overlay's own file handle and lands on the original inode
+#
+# So the overlay is replaced by a plain directory that contains the patched
+# jar and no prebuilt artifacts.  ART then extracts the dex from the jar that
+# is really there.
+PF="$MODDIR/pf"
+PF_JAR="$PF/com.oplus.camera.unit.sdk.jar"
+
+if [ ! -f "$PF_JAR" ]; then
+  rm -rf "$PF" 2>/dev/null
+  mkdir -p "$PF" 2>/dev/null
+  cp -a /product/framework/. "$PF/" 2>/dev/null
+fi
+
+# the patched jar has to be the one in the replacement directory
+cp -f "$SDK_SRC" "$PF_JAR" 2>/dev/null
+
+# and the OEM's prebuilt artifacts must not be in it
+for f in "$PF/oat/arm64/com.oplus.camera.unit.sdk.vdex" "$PF/oat/arm64/com.oplus.camera.unit.sdk.odex"; do
+  [ -e "$f" ] && : > "$f" 2>/dev/null
+done
+
+bind_once "$PF" /product/framework ""
+
 # The prebuilt artifacts are invalidated as well, so ART can never fall back
 # to the stock compiled code.
 #
@@ -151,6 +198,7 @@ for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
   break
 done
 if [ -n "$Z" ]; then
+  bind_once "$PF" /product/framework "$Z"
   bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
   for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
     bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" "$Z"
