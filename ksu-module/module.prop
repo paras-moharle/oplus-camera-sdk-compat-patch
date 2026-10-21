@@ -1,6 +1,6 @@
-id=ocam_sdkfix
-name=Oplus CameraUnit SDK compat patch
-version=v1.5
-versionCode=5
+id=ocam_camfix
+name=Oplus camera fix (CameraUnit SDK + thermal bypass)
+version=v2.0
+versionCode=10
 author=Paras Moharle
-description=Patches /product/framework/com.oplus.camera.unit.sdk.jar so that (1) the "com.oplus.picture.exif.flag" capture parameter accepts long[] as well as int[], (2) ProducerImpl.takePicture() no longer cancels a capture because the AI/APS stack never finishes, and (3) BaseMode.isNeedAPSProcess() returns false so the plain capture path is used instead of the broken AI/APS one. Required by Oplus Camera 6.070.215+ on firmware that still ships the 6.020.980-era CameraUnit SDK. The patch is applied as a bind mount into the zygote mount namespace, the original file on disk is never modified. Disable this module after a ColorOS OTA.
+description=Fixes the Oplus camera on firmware whose ODM is missing the AI libraries. (1) Patches /product/framework/com.oplus.camera.unit.sdk.jar so the camera stops cancelling every capture: the exif flag accepts long[] as well as int[], the broken AI/APS path is disabled and the capture gate can no longer refuse a shot. Without this the camera takes NO photo at all, not even with the stock camera app. (2) Patches /system/framework/oplus-framework.jar so the camera process sees 30 degC instead of the real skin temperature, which stops the camera from deferring captures on a warm phone. The thermal bypass can be switched on and off at run time: hold volume-down for 2 seconds (hold volume-up for 2 seconds to see the state). Both patches are bind mounts, the original files on disk are never modified. Disable this module after a ColorOS OTA.

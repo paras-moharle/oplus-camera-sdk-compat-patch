@@ -1,60 +1,185 @@
 #!/system/bin/sh
 #
-# Oplus CameraUnit SDK compat patch - late start watcher  (author: Paras Moharle)
+# Oplus camera fix - service  (author: Paras Moharle)
 #
-# WHY THIS EXISTS
-# ---------------
-# The patched jar only takes effect if it is mounted into the ZYGOTE's mount
-# namespace before the camera app is forked from it (ART extracts classes.dex
-# from the jar when the app process starts - a mount that appears later is
-# never seen).
+# Three jobs:
 #
-# post-fs-data.sh normally wins that race: it runs at ~t=10 s and the zygote
-# starts at ~t=12-13 s.  On a loaded phone (this one runs a MediaTek MKP
-# kernel-panic storm, load average 20+) the zygote sometimes starts first and
-# the race is lost - the camera then silently keeps using the stock jar and
-# every photo is cancelled with CF_APS_FINISH_ADD_FRAME.
+#  1. Close the boot-time race for the SDK jar.  post-fs-data.sh mounts the
+#     patched jar into the zygote's mount namespace, but the zygote does not
+#     always start after post-fs-data (this phone runs a MediaTek MKP
+#     kernel-panic storm, load average 20+, and the zygote is sometimes
+#     early).  This watcher mounts it as soon as the zygote is there.
 #
-# This watcher closes the race from the other side: as soon as the zygote is
-# running it mounts the patched jar into the zygote's namespace.  Every app
-# forked from that point on inherits the mount.
+#  2. The volume key toggle for the thermal bypass.
 #
-# It also re-applies the mount into the camera app's own namespace.  That is
-# only useful for code that opens the jar *after* the app has started (the
-# dex is already extracted by then), but it costs nothing and keeps the file
-# consistent for the app.
+#        hold volume-down for 2 s   ->  toggle the thermal bypass
+#        hold volume-up   for 2 s   ->  show the current state
+#
+#     The bypass is a system property that the patched
+#     OplusHoraeThermalHelper reads on every call, so the change is effective
+#     immediately - no reboot, no remount.  The property is persist.*, so the
+#     choice survives a reboot.
+#
+#     A short press still changes the volume as usual: the raw key events are
+#     only *read* here, never consumed.
+#
+#  3. Watchdog: if the camera's private-log writer gets stuck in a retry loop
+#     (it cannot write /data/vendor because of the SELinux policy), it pegs a
+#     CPU core and eventually gets the camera process killed.  If that is
+#     detected, the private log is switched off so the camera survives.
 #
 # SAFETY
 # ------
-# * Only "mount --bind" is used.  No chcon / setfattr / setenforce: the MKP
-#   kernel-integrity module panics the kernel if the SELinux state changes
-#   while the system boots.
+# * Only "mount --bind", "setprop" and "getevent" are used.  No chcon /
+#   setfattr / setenforce: the MKP kernel-integrity module panics the kernel
+#   if the SELinux state changes while the system boots.
 # * Every failure path exits 0.  This script can never fail a boot.
 # * It never restarts or kills any app.
 
-MODDIR=/data/adb/modules/ocam_sdkfix
-SRC="$MODDIR/SDK-PATCHED.jar"
-TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+MODDIR=/data/adb/modules/ocam_camfix
+SDK_SRC="$MODDIR/SDK-PATCHED.jar"
+SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+PROP=persist.oplus.camera.thermal_bypass
 
-[ -f "$SRC" ] || exit 0
+[ -f "$SDK_SRC" ] || exit 0
 
-EXPECT=$(cat "$MODDIR/SDK-PATCHED.jar.size" 2>/dev/null)
-[ -n "$EXPECT" ] || exit 0
+# The switch has to exist even if the user never touches the volume keys.
+if [ "$(getprop $PROP)" = "" ]; then
+  setprop $PROP 1
+fi
 
-SZ=$(stat -c %s "$SRC" 2>/dev/null)
-[ -n "$SZ" ] || exit 0
-[ "$SZ" = "$EXPECT" ] || exit 0
+# ------------------------------------------------------------------ helpers
 
-LAST_Z=""
-LAST_PID=""
+now_ms() {
+  # /proc/uptime has centisecond resolution - plenty for a 2 s threshold
+  awk '{printf "%d", $1 * 1000}' /proc/uptime 2>/dev/null
+}
+
+say() {
+  log -t ocam_camfix "$*"
+}
+
+# Post a short notification so the user sees what happened.  Falls back to
+# the log if the notification service refuses the post.
+notify() {
+  TITLE="$1"; TEXT="$2"
+  say "$TITLE: $TEXT"
+  cmd notification post "$TITLE" "$TEXT" >/dev/null 2>&1 || true
+}
+
+thermal_state() {
+  S=$(getprop $PROP)
+  [ "$S" = "0" ] && S=1 || S=0
+  if [ "$S" = "1" ]; then
+    echo "ON (the camera sees 30 degC instead of the real skin temperature)"
+  else
+    echo "OFF (the camera sees the real skin temperature)"
+  fi
+}
+
+toggle_thermal() {
+  S=$(getprop $PROP)
+  if [ "$S" = "0" ]; then
+    NEW=1
+  else
+    NEW=0
+  fi
+  setprop $PROP "$NEW"
+  if [ "$NEW" = "1" ]; then
+    notify "Oplus camera fix" "Thermal bypass ON - the camera no longer waits for the phone to cool down"
+  else
+    notify "Oplus camera fix" "Thermal bypass OFF - the camera sees the real temperature again"
+  fi
+}
+
+show_thermal() {
+  T=$(dumpsys horae 2>/dev/null | sed -n 's/.*Temp:\([0-9.]*\).*/\1/p' | head -1)
+  [ -n "$T" ] || T="?"
+  notify "Oplus camera fix" "Thermal bypass: $(thermal_state)  Real skin temperature: ${T} degC"
+}
+
+# Handle one raw key event.
+#
+#   EV_KEY            = 0001
+#   KEY_VOLUMEDOWN    = 0073 (115)
+#   KEY_VOLUMEUP      = 0074 (116)
+#   value 1 = down, 0 = up, 2 = auto-repeat
+#
+# The events are only READ, never grabbed, so the volume still works normally.
+# getevent prints them in one of a few shapes depending on the build and the
+# flags, so all of them are accepted:
+#
+#   /dev/input/event7: 0001 0073 00000001
+#   0001 0073 00000001
+#   0001 0073 00000001   (EV_KEY, KEY_VOLUMEDOWN, DOWN)
+#
+handle_key() {
+  LINE="$1"
+  case "$LINE" in /dev/input/*) LINE="${LINE#*: }" ;; esac
+
+  F1="${LINE%% *}"; R="${LINE#* }"; F2="${R%% *}"; R="${R#* }"; F3="${R%% *}"
+
+  if [ "$F1" = "0001" ]; then
+    case "$F2" in
+      0073) KEY=down ;;
+      0074) KEY=up ;;
+      *) return 0 ;;
+    esac
+    case "$F3" in
+      00000001) PRESS=1 ;;
+      00000000) PRESS=0 ;;
+      *) return 0 ;;
+    esac
+  else
+    # label-only shape: "EV_KEY KEY_VOLUMEDOWN DOWN"
+    case "$LINE" in
+      *KEY_VOLUMEDOWN*DOWN*) KEY=down; PRESS=1 ;;
+      *KEY_VOLUMEUP*DOWN*)   KEY=up;   PRESS=1 ;;
+      *KEY_VOLUMEDOWN*UP*)   KEY=down; PRESS=0 ;;
+      *KEY_VOLUMEUP*UP*)     KEY=up;   PRESS=0 ;;
+      *) return 0 ;;
+    esac
+  fi
+
+  if [ "$PRESS" = "1" ]; then
+    DOWN_KEY="$KEY"
+    DOWN_TS=$(now_ms)
+    return 0
+  fi
+
+  # released
+  if [ "$KEY" = "$DOWN_KEY" ] && [ -n "$DOWN_TS" ]; then
+    DUR=$(( $(now_ms) - DOWN_TS ))
+    say "key $KEY released after ${DUR} ms"
+    if [ "$DUR" -ge 2000 ]; then
+      if [ "$KEY" = "down" ]; then
+        toggle_thermal
+      else
+        show_thermal
+      fi
+    fi
+  fi
+  DOWN_KEY=""
+  DOWN_TS=""
+  return 0
+}
+
+DOWN_KEY=""
+DOWN_TS=""
+
+key_watch() {
+  getevent -q 2>/dev/null | while read -r LINE; do
+    case "$LINE" in
+      *KEY_VOLUME*|*0073*|*0074*) handle_key "$LINE" ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------- watchdog
 SPIN_ACC=0
 SPIN_N=0
+SPIN_PREV=""
 
-# The camera's private-log writer (persist.sys.camera.private.log.enable) can
-# end up in a tight retry loop if it is not allowed to write /data/vendor.
-# That loop pegs one CPU core, floods the log buffer and gets the camera
-# process killed.
-#
 # Measured on this device (CPU ticks per 0.5 s sample):
 #   idle                    0 - 1
 #   during a capture       21 - 78, for ~6 s
@@ -84,10 +209,18 @@ watchdog_camera_spin() {
   # 60 samples = 30 s of continuous busy, 1800 ticks = 30 CPU-seconds
   if [ "$SPIN_N" -ge 60 ] && [ "$SPIN_ACC" -ge 1800 ]; then
     setprop persist.sys.camera.private.log.enable false
+    say "the camera is spinning - the private log has been switched off"
     SPIN_ACC=0
     SPIN_N=0
   fi
 }
+
+# --------------------------------------------------------------------- main
+key_watch &
+KEYPID=$!
+
+LAST_Z=""
+LAST_PID=""
 
 while true; do
   # --- the zygote: the important one -------------------------------------
@@ -99,18 +232,18 @@ while true; do
 
   if [ -n "$Z" ] && [ "$Z" != "$LAST_Z" ]; then
     LAST_Z="$Z"
-    nsenter -t "$Z" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+    nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
   fi
 
   # --- init namespace (in case it was lost) ------------------------------
-  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$TGT"; then
-    mount --bind "$SRC" "$TGT" 2>/dev/null
+  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; then
+    mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
   fi
 
-  # --- the camera app's own namespace (cosmetic, see header) -------------
+  # --- the camera app's own namespace (cosmetic) -------------------------
   PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
   if [ -n "$PID" ] && [ "$PID" != "$LAST_PID" ]; then
-    nsenter -t "$PID" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+    nsenter -t "$PID" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
     LAST_PID="$PID"
   fi
 

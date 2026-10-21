@@ -1,48 +1,51 @@
 #!/system/bin/sh
 #
-# Oplus CameraUnit SDK compat patch  (author: Paras Moharle)
+# Oplus camera fix - CameraUnit SDK + thermal bypass  (author: Paras Moharle)
 #
-# WHY
-# ---
-# The Oplus CameraUnit SDK (com.oplus.camera.unit.sdk.jar) that ships with
-# 6.020.980-era firmware drives the still capture.  Three things in it have
-# to be corrected for the camera to work on this device:
+# WHAT THIS MODULE DOES
+# ---------------------
+# Two independent fixes, one module:
 #
-#  1. BaseMode.updateCaptureRequestTag() reads the capture parameter
-#     "com.oplus.picture.exif.flag" with a hard (int[]) cast.  Newer camera
-#     apps store it as a long[] -> java.lang.ClassCastException, the capture
-#     request is never built and the shot is cancelled.
+#  1. CameraUnit SDK (com.oplus.camera.unit.sdk.jar, /product/framework)
+#     - BaseMode.updateCaptureRequestTag() accepts long[] as well as int[]
+#     - BaseMode.isNeedAPSProcess() returns false  (the AI/APS stack cannot run
+#       on this firmware, so the camera must not use it)
+#     - ProducerImpl.takePicture() can no longer cancel a capture because the
+#       APS did not finish
+#     Without this the camera takes NO photo at all - not even with the stock
+#     6.020.980 app.
 #
-#  2. ProducerImpl.takePicture() refuses every capture while the AI/APS
-#     stack has not finished ("mbApsFinishAddFrame"), which it never does on
-#     this firmware because /odm/lib64 is missing
-#     libai_perception_scene_detect.so, libarcsoft_hdr_denoise_api_v4.so,
-#     libImplicitWatermark.so, libUpScale.so and the com.oplus.aps.params.*
-#     config.
+#  2. Thermal bypass (oplus-framework.jar, /system/framework)
+#     The camera app defers every capture while the skin temperature is above
+#     the hard-coded 41 degC limit.  The patched
+#     com/oplus/util/OplusHoraeThermalHelper reports 30 degC / status 13 to the
+#     camera process only.  Every other app keeps the real values.
 #
-#  3. BaseMode.isNeedAPSProcess() is hard-coded to true, so the camera always
-#     enters the broken APS branch.  It has to return false so the plain
-#     (no-AI) capture path is used.
+#     The bypass can be switched OFF at run time with a volume key - see
+#     service.sh.  It is controlled by the system property
 #
-# All three patches are in one patched copy of the jar.  The original file on
-# disk is NOT modified - the patched copy is bind-mounted over it.
+#         persist.oplus.camera.thermal_bypass   (1 = on, 0 = off)
 #
 # THE MOUNT NAMESPACE (the part that is easy to get wrong)
 # ------------------------------------------------------
 # The camera app does not run in the mount namespace of init:
 #
-#   * init creates /product/framework as an OverlayFS whose lowerdir is
-#     /mnt/vendor/my_product/product_overlay/framework/
 #   * the zygote unshares its own mount namespace and makes the root mount a
-#     slave, so every mount that init performs AFTER the zygote has started
-#     is invisible to the zygote and to every app forked from it
+#     slave, so every mount that init performs AFTER the zygote has started is
+#     invisible to the zygote and to every app forked from it
 #   * ART extracts classes.dex from the jar when the app process starts, so
 #     mounting the patched jar into the app's namespace afterwards is USELESS
 #     - the app has already loaded the stock classes
 #
-# So the patched jar has to be mounted into the ZYGOTE's mount namespace
+# So the patched SDK jar has to be mounted into the ZYGOTE's mount namespace
 # before the camera app is forked from it.  That is what this script does
 # (and what service.sh retries if the zygote was not up yet).
+#
+# oplus-framework.jar is a BOOTCLASSPATH jar: the zygote opens it once at
+# boot and keeps it mapped, so the mount over it can only be created at boot
+# time (unmounting it later fails with "Device or resource busy").  That is
+# why the thermal bypass is switched through a system property that the
+# patched class reads on every call, instead of by re-mounting the jar.
 #
 # SAFETY - READ BEFORE EDITING
 # ---------------------------
@@ -53,27 +56,35 @@
 #   The SELinux label of the jar is therefore set ONCE, at install time, by
 #   install.sh - never from a boot-time script.
 # * Every failure path exits 0.  This script can never fail a boot.
-# * Nothing outside /data/adb/modules/ocam_sdkfix and the single bind mount
-#   is touched.
+# * Nothing outside /data/adb/modules/ocam_camfix and the two bind mounts is
+#   touched.
 
-MODDIR=/data/adb/modules/ocam_sdkfix
-SRC="$MODDIR/SDK-PATCHED.jar"
-TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+MODDIR=/data/adb/modules/ocam_camfix
 
-[ -f "$SRC" ] || exit 0
+SDK_SRC="$MODDIR/SDK-PATCHED.jar"
+SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+OFW_SRC="$MODDIR/PATCHED-ofw.jar"
+OFW_TGT=/system/framework/oplus-framework.jar
 
-# expected size of the patched jar - guards against a truncated/partial file
-EXPECT=$(cat "$MODDIR/SDK-PATCHED.jar.size" 2>/dev/null)
-[ -n "$EXPECT" ] || exit 0
+[ -f "$SDK_SRC" ] || exit 0
+[ -f "$OFW_SRC" ] || exit 0
 
-SZ=$(stat -c %s "$SRC" 2>/dev/null)
-[ -n "$SZ" ] || exit 0
-[ "$SZ" = "$EXPECT" ] || exit 0
+# The run-time switch for the thermal bypass.  A persist.* property survives
+# a reboot, so the user's choice is kept.
+if [ "$(getprop persist.oplus.camera.thermal_bypass)" = "" ]; then
+  setprop persist.oplus.camera.thermal_bypass 1
+fi
 
-# 1) the init namespace - makes the patched jar visible to everything that
-#    is started from here on (including the zygote, if it is not up yet)
-if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$TGT"; then
-  mount --bind "$SRC" "$TGT" 2>/dev/null
+# ---------------------------------------------------------------- SDK jar
+SDK_EXPECT=$(cat "$MODDIR/SDK-PATCHED.jar.size" 2>/dev/null)
+[ -n "$SDK_EXPECT" ] || exit 0
+SDK_SZ=$(stat -c %s "$SDK_SRC" 2>/dev/null)
+[ -n "$SDK_SZ" ] || exit 0
+[ "$SDK_SZ" = "$SDK_EXPECT" ] || exit 0
+
+# 1) the init namespace
+if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; then
+  mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
 fi
 
 # 2) the zygote namespace - this is the one that matters.  The zygote forks
@@ -84,9 +95,19 @@ for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
   Z="$p"
   break
 done
-
 if [ -n "$Z" ]; then
-  nsenter -t "$Z" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+  nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+fi
+
+# ----------------------------------------------------------- framework jar
+OFW_EXPECT=$(cat "$MODDIR/PATCHED-ofw.jar.size" 2>/dev/null)
+[ -n "$OFW_EXPECT" ] || exit 0
+OFW_SZ=$(stat -c %s "$OFW_SRC" 2>/dev/null)
+[ -n "$OFW_SZ" ] || exit 0
+[ "$OFW_SZ" = "$OFW_EXPECT" ] || exit 0
+
+if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$OFW_TGT"; then
+  mount --bind "$OFW_SRC" "$OFW_TGT" 2>/dev/null
 fi
 
 exit 0

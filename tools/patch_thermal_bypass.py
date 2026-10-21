@@ -36,9 +36,20 @@ Patch the framework that owns the temperature source:
         getThermalStatus()I    ->  returns the real horae level
 
 For the camera process only (uid given on the command line) they now return a
-capped value (30.0f / 0), i.e. the camera behaves as if the phone were cool.
+capped value (30.0f / 13), i.e. the camera behaves as if the phone were cool.
 Every other process still sees the real values, so battery charging limits,
 game mode and the thermal governor keep working normally.
+
+The bypass is switched on and off at RUN TIME by a system property:
+
+    persist.oplus.camera.thermal_bypass   (default: on)
+
+The property is read on every call, so flipping it takes effect immediately -
+no reboot, no remount.  That matters because oplus-framework.jar is a
+bootclasspath jar: the zygote opens it once at boot and keeps it mapped, so
+the mount over it cannot be changed while the system is running
+("Device or resource busy").  A property check inside the class is the only
+way to switch it live.
 
 The jar is patched and bind-mounted over the original (the file on disk is
 never modified), exactly like the CameraUnit SDK patch.
@@ -58,7 +69,8 @@ def die(msg):
     sys.exit(1)
 
 
-def patch_method(lines, method_sig, uids, label_hit, label_miss, body, marker):
+def patch_method(lines, method_sig, uids, label_hit, label_miss, body, marker,
+                 guard=None):
     """Insert a UID-guarded early return at the start of a method."""
     start = None
     for i, l in enumerate(lines):
@@ -99,6 +111,12 @@ def patch_method(lines, method_sig, uids, label_hit, label_miss, body, marker):
     block += [
         "    goto %s" % label_miss,
         "    %s" % label_hit,
+    ]
+    if guard:
+        # The bypass can be switched off at run time without touching the jar
+        # again: the switch is a system property that is read on EVERY call.
+        block += list(guard)
+    block += [
         "    %s" % body,
         "    %s" % marker,
         "    %s" % label_miss,
@@ -126,6 +144,10 @@ def main():
                          "only uses the AI/EAP capture path when this is < 13; "
                          "13+ makes it take the plain capture path, which is the "
                          "one that works on this firmware")
+    ap.add_argument("--property", default="persist.oplus.camera.thermal_bypass",
+                    help="system property that switches the bypass on/off at "
+                         "run time. It is read on every call, so flipping it "
+                         "takes effect immediately without a reboot")
     ap.add_argument("--check", action="store_true",
                     help="only report whether the patch is present")
     args = ap.parse_args()
@@ -152,20 +174,42 @@ def main():
     temp_bits = struct.unpack("<I", struct.pack("<f", bits))[0]
     body_f = "const/high16 v0, 0x%x" % temp_bits
 
+    # The run-time switch.  getBoolean() never throws for a missing property
+    # and accepts "1/0/true/false/on/off/y/n/yes/no", so a hand-typed value
+    # can never crash the camera app.
+    guard = [
+        "    # the bypass can be switched off at run time (volume key toggle);",
+        "    # the property is read on every call, so a change takes effect",
+        "    # immediately - no reboot, no remount.",
+        "    const-string v0, \"%s\"" % args.property,
+        "    const/4 v1, 0x1",
+        "    invoke-static {v0, v1}, Landroid/os/SystemProperties;->getBoolean(Ljava/lang/String;Z)Z",
+        "    move-result v0",
+        "    if-eqz v0, :ocam_no_thermal_bypass",
+    ]
+    guard_status = [
+        "    const-string v0, \"%s\"" % args.property,
+        "    const/4 v1, 0x1",
+        "    invoke-static {v0, v1}, Landroid/os/SystemProperties;->getBoolean(Ljava/lang/String;Z)Z",
+        "    move-result v0",
+        "    if-eqz v0, :ocam_no_thermal_bypass_status",
+    ]
+
     lines = patch_method(
         lines, "getCurrentThermal()F", uids,
         ":ocam_thermal_bypass", ":ocam_no_thermal_bypass",
-        body_f, "return v0")
+        body_f, "return v0", guard)
     lines = patch_method(
         lines, "getThermalStatus()I", uids,
         ":ocam_thermal_bypass_status", ":ocam_no_thermal_bypass_status",
-        "const/16 v0, 0x%x" % args.status, "return v0")
+        "const/16 v0, 0x%x" % args.status, "return v0", guard_status)
 
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
 
-    print("  [ok] patched %s for uid(s) %s (temp=%s degC, status=%d)"
-          % (TARGET, ",".join(str(u) for u in uids), args.temp, args.status))
+    print("  [ok] patched %s for uid(s) %s (temp=%s degC, status=%d, switch=%s)"
+          % (TARGET, ",".join(str(u) for u in uids), args.temp, args.status,
+             args.property))
     return 0
 
 
