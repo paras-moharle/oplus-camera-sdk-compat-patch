@@ -61,18 +61,6 @@ capped temperature. Every other app keeps the real one.
 
 Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
 
-### Dashboard
-
-`ocam_webui` shows the live state of both modules — enabled, bind mount
-active, the deployed SHA256 versus the expected one, whether the file that is
-actually mounted is the patched one, the bypass parameters, camera state and the
-MKP panic rate — with buttons to re-mount, force stop / restart the camera and
-fire a test capture.
-
-```bash
-./install_webui.sh                  # http://127.0.0.1:8787
-adb forward tcp:8787 tcp:8787       # then open it from the PC
-```
 
 ---
 
@@ -270,7 +258,6 @@ README.md                    this file
 LICENSE                      MIT
 install.sh                   patch + install + reboot      (device side)
 install_thermalfix.sh        optional: camera thermal bypass (device side)
-install_webui.sh             optional: the dashboard        (device side)
 uninstall.sh                 rollback  (--thermal also removes the bypass)
 ksu-module/
   module.prop                KernelSU module metadata
@@ -280,12 +267,6 @@ ksu-module-thermal/
   module.prop                KernelSU module metadata (optional module)
   post-fs-data.sh            boot-time bind mount of the framework jar
   service.sh                 late-start fallback
-ksu-module-webui/
-  module.prop                dashboard module
-  service.sh                 starts the httpd on 127.0.0.1:8787
-  webroot/index.html         the dashboard
-  webroot/cgi-bin/status.sh  live state as JSON
-  webroot/cgi-bin/action.sh  re-mount / force stop / restart / shutter
 tools/
   patch_sdk.py               applies the fix to a decoded smali tree
   dexfp.py                   dex reader: inventory / fingerprint / compare

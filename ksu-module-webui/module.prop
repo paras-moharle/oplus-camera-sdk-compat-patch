@@ -1,6 +1,0 @@
-id=ocam_webui
-name=Oplus camera patch dashboard
-version=v1.0
-versionCode=1
-author=Paras Moharle
-description=Web dashboard for the Oplus camera patches (ocam_sdkfix + ocam_thermalfix). Shows for each module: enabled state, SHA256 of the deployed jar versus the expected hash, whether the bind mount is actually in place, the thermal-bypass parameters, camera/thermal state and the MKP panic rate. Buttons to re-mount both modules, force stop / restart the camera and run a test capture. Served on http://127.0.0.1:8787 (adb forward tcp:8787 tcp:8787). No service is started outside this module; it only reads state and runs the modules' own mount scripts.
