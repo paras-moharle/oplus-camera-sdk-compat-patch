@@ -55,16 +55,32 @@ fi
 # compiled code.
 [ -f "$MODDIR/empty.bin" ] || : > "$MODDIR/empty.bin" 2>/dev/null
 
+# bind_once <source> <target> [namespace]
+#
+# NEVER stack a mount.  A mount on a path that is already mounted creates a
+# NEW mount on top of it, and repeating that in a loop fills the mount table
+# until the kernel gives up - which is exactly what crashed the phone once.
+# So the target is always checked first, in the namespace it is going to be
+# created in.
+bind_once() {
+  SRC="$1"; TGT="$2"; NS="$3"
+  [ -e "$TGT" ] || return 0
+  if [ -n "$NS" ]; then
+    nsenter -t "$NS" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
+      | grep -qx "$TGT" && return 0
+    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+  else
+    awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
+      | grep -qx "$TGT" && return 0
+    mount --bind "$SRC" "$TGT" 2>/dev/null
+  fi
+}
+
 mask_prebuilt() {
   # $1 = the namespace to work in ("" = the current one)
   NS="$1"
   for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
-    [ -e "$OAT_DIR/$f" ] || continue
-    if [ -n "$NS" ]; then
-      nsenter -t "$NS" -m -- mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
-    else
-      mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
-    fi
+    bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" "$NS"
   done
 }
 
@@ -268,14 +284,14 @@ while true; do
   if [ -n "$Z" ]; then
     if [ "$Z" != "$LAST_Z" ]; then
       LAST_Z="$Z"
-      nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+      bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
       mask_prebuilt "$Z"
       clear_dex_cache
     elif [ $((WATCH_N % 4)) -eq 0 ]; then
       if ! nsenter -t "$Z" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
            | grep -qx "$SDK_TGT"; then
         say "the zygote namespace lost the patched jar - restoring it"
-        nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+        bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
         mask_prebuilt "$Z"
         # ART caches the dexopt output in /data/dalvik-cache.  If that cache
         # was built from the stock jar it would keep being used, so it has to
@@ -288,15 +304,14 @@ while true; do
   fi
 
   # --- init namespace (in case it was lost) ------------------------------
-  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; then
-    mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
-  fi
+  bind_once "$SDK_SRC" "$SDK_TGT" ""
   mask_prebuilt ""
 
   # --- the camera app's own namespace (cosmetic) -------------------------
   PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
   if [ -n "$PID" ] && [ "$PID" != "$LAST_PID" ]; then
-    nsenter -t "$PID" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+    bind_once "$SDK_SRC" "$SDK_TGT" "$PID"
+    mask_prebuilt "$PID"
     LAST_PID="$PID"
   fi
 

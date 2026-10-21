@@ -82,10 +82,28 @@ SDK_SZ=$(stat -c %s "$SDK_SRC" 2>/dev/null)
 [ -n "$SDK_SZ" ] || exit 0
 [ "$SDK_SZ" = "$SDK_EXPECT" ] || exit 0
 
+# bind_once <source> <target> [namespace]
+#
+# NEVER stack a mount: a mount on an already-mounted path creates another
+# mount on top of it, and doing that in a loop fills the mount table until
+# the kernel gives up (this crashed the phone once).  The target is always
+# checked first, in the namespace the mount is going to be created in.
+bind_once() {
+  SRC="$1"; TGT="$2"; NS="$3"
+  [ -e "$TGT" ] || return 0
+  if [ -n "$NS" ]; then
+    nsenter -t "$NS" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
+      | grep -qx "$TGT" && return 0
+    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+  else
+    awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
+      | grep -qx "$TGT" && return 0
+    mount --bind "$SRC" "$TGT" 2>/dev/null
+  fi
+}
+
 # 1) the init namespace
-if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; then
-  mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
-fi
+bind_once "$SDK_SRC" "$SDK_TGT" ""
 
 # ART keeps the dexopt output of the jar in /data/dalvik-cache.  If that
 # cache was built from the STOCK jar it would keep being used and the camera
@@ -124,9 +142,7 @@ OAT_DIR=/product/framework/oat/arm64
 : > "$MODDIR/empty.bin" 2>/dev/null
 for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
   [ -e "$OAT_DIR/$f" ] || continue
-  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$OAT_DIR/$f"; then
-    mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
-  fi
+  bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" ""
 done
 
 Z=""
@@ -135,9 +151,9 @@ for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
   break
 done
 if [ -n "$Z" ]; then
-  nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+  bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
   for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
-    [ -e "$OAT_DIR/$f" ] && nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
+    bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" "$Z"
   done
 fi
 
@@ -148,8 +164,6 @@ OFW_SZ=$(stat -c %s "$OFW_SRC" 2>/dev/null)
 [ -n "$OFW_SZ" ] || exit 0
 [ "$OFW_SZ" = "$OFW_EXPECT" ] || exit 0
 
-if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$OFW_TGT"; then
-  mount --bind "$OFW_SRC" "$OFW_TGT" 2>/dev/null
-fi
+bind_once "$OFW_SRC" "$OFW_TGT" ""
 
 exit 0
