@@ -319,3 +319,26 @@ release as camera 6.070.215.
 
 **And after a ColorOS OTA — disable the module**, or it will replace the new
 SDK with this older patched build.
+
+---
+
+## Appendix: why the camera app could still fail after the SDK patch
+
+The SDK patch is a bind mount in the **init** mount namespace. The camera app
+does **not** live there: it creates its own namespace in which
+`/product/framework` is an OverlayFS mount whose lowerdir already contains
+`com.oplus.camera.unit.sdk.jar`. The app therefore kept loading the **stock**
+jar and kept throwing
+
+```
+java.lang.ClassCastException: long[] cannot be cast to int[]
+```
+
+Whether the app saw the patched jar depended on when its namespace was created
+relative to the boot-time mount - the "it works for a while and then stops"
+behaviour.
+
+`ksu-module/service.sh` now watches for the camera process and mounts the
+patched jar into the app's own namespace (measured ~250 ms after the process
+starts, before the capture classes are used).
+

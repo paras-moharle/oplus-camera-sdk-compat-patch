@@ -109,6 +109,47 @@ The **AI unit (`com.oplus.aiunit`) is deliberately not patched** — it must kee
 seeing the real thermal state, otherwise its own inference refuses to run
 (`AIUnit-Plugin-DetectEngine: runByByte onFailed`).
 
+## Why the camera needs this module at all (not just for speed)
+
+The camera's private log (`/data/vendor/cam_alog_*.txt`, needs
+`persist.sys.camera.private.log.enable=true` plus a SELinux rule letting the
+camera write `/data/vendor`) shows the real sequence of a failed capture:
+
+```
+CameraUnit, ProducerImpl: setApsFinishAddFrame, mbApsFinishAddFrame: false->false
+CameraUnit, ProducerImpl: takePicture, not allow take picture,
+        mbApsFinishAddFrame: false, isApsCaptureAlgoInitializing: false
+OCAM_CaptureProcessor: onDeviceCaptureCanceled, capture: 2
+```
+
+Camera 6.070.215 wants to capture through the **APS** (AI multi-frame) stack.
+On this firmware the APS cannot start:
+
+```
+[ALGO_ASD]     load aiPerceptionLib failed because of dlopen error
+[ALGO_ASD]     ASD init load ASDlib failed because load library find AISceneExecSegCls failed
+[ALGO_ASD]     AISDlib ... load library find AISceneExecSegClsV2 failed
+[ALGO_BASE]    isSupportAlgoAPI() loadlibrary failed
+[ALGO_FACEINFO] faceInfoLoadlib() loadlibrary failed, need st_face sdk version >= v1_5_11_26
+[ALGO_AICOLOR] get com.oplus.aps.params.aicolor failed, use default params
+```
+
+All of those libraries live in **`/odm/lib64/`** (the ODM partition, i.e. the
+*firmware*, not the app) and this 6.020.980-era ODM simply does not have the
+newer ones - `/odm/lib64` has 399 libraries, none of them
+`libai_perception_scene_detect.so`, `libarcsoft_hdr_denoise_api_v4.so`,
+`libImplicitWatermark.so`, `libUpScale.so` or
+`libOPAlgoCamAIBeautyBodyDetection.so`. The APS parameter config
+(`/odm/etc/camera/config/oplus_camera_feature_config`) is missing as well.
+
+So the APS never completes, `mbApsFinishAddFrame` stays **false**, and the
+SDK's `takePicture()` refuses **every** capture. Reporting the thermal status
+as **13** makes the camera decide "too hot, don't use the AI path", so it takes
+the plain capture path - which works.
+
+**⇒ The thermal bypass is not only a speed optimisation on this firmware: it is
+what makes the new camera able to take a photo at all.**
+
 ## How it is deployed
 
 * The jar is **bind-mounted** over `/system/framework/oplus-framework.jar`; the
