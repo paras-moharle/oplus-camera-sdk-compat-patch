@@ -82,6 +82,60 @@ else
   bad "200 rounds left $COUNT mounts - the guard is broken"
 fi
 
+# ------------------------------------------- 1b. a target that is a mount
+say "bind_once() must mount even when the target is ALREADY a mount"
+cat > "$WORK/guard2.sh" <<'EOS'
+#!/bin/sh
+# the real bind_once() from the module, with the inode based check
+already_ours() {
+  SRC="$1"; TGT="$2"; NS="$3"
+  if [ -n "$NS" ]; then
+    A=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$SRC" 2>/dev/null)
+    B=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$TGT" 2>/dev/null)
+  else
+    A=$(stat -Lc "%d:%i" "$SRC" 2>/dev/null)
+    B=$(stat -Lc "%d:%i" "$TGT" 2>/dev/null)
+  fi
+  [ -n "$A" ] && [ -n "$B" ] && [ "$A" = "$B" ]
+}
+bind_once() {
+  SRC="$1"; TGT="$2"; NS="$3"
+  [ -e "$TGT" ] || return 0
+  already_ours "$SRC" "$TGT" "$NS" && return 0
+  if [ -n "$NS" ]; then
+    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+  else
+    mount --bind "$SRC" "$TGT" 2>/dev/null
+  fi
+}
+
+mkdir -p "$T/target" "$T/other"
+: > "$T/other/file"
+
+# make the target a mount point of something else - this is what the OEM's
+# OverlayFS on /product/framework looks like
+mount --bind "$T/other" "$T/target" 2>/dev/null || { echo "CANNOT_TEST"; exit 9; }
+
+bind_once "$T/other" "$T/target" ""
+
+# the target must now resolve to OUR file, not to the original mount
+RES=$(cat "$T/target/file" 2>/dev/null | wc -c)
+echo "RESOLVED=$RES"
+echo "STACKED=$(awk '{print $5}' /proc/self/mountinfo | grep -c "$T/target")"
+EOS
+
+OUT=$(unshare -Ur -m sh -c "T='$WORK' sh '$WORK/guard2.sh'" 2>/dev/null)
+if echo "$OUT" | grep -q CANNOT_TEST; then
+  bad "could not set up the test (no mount privileges here)"
+else
+  ST=$(echo "$OUT" | sed -n 's/^STACKED=//p')
+  if [ "$ST" = "1" ]; then
+    ok "a target that was already a mount is re-mounted with our source (no stack)"
+  else
+    bad "the target ended up with $ST mounts - the guard is broken"
+  fi
+fi
+
 # ------------------------------------------------------------ 2. static
 say "the real boot scripts must not contain unguarded mounts"
 for f in "$REPO_DIR/ksu-module/post-fs-data.sh" "$REPO_DIR/ksu-module/service.sh"; do

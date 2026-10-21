@@ -91,24 +91,40 @@ SDK_SZ=$(stat -c %s "$SDK_SRC" 2>/dev/null)
 MOUNTS_MADE=0
 MOUNT_CAP=16
 
+# Is $SRC already mounted at $TGT (in the namespace $NS, or the current one)?
+#
+# The check has to compare the INODE, not just the path: /product/framework is
+# already a mount (the OEM's OverlayFS), so a path-only check would wrongly
+# conclude "already done" and never mount our replacement directory.
+# Comparing the device+inode of the source with the device+inode that the
+# target resolves to tells us whether *our* file is already there.
+already_ours() {
+  SRC="$1"; TGT="$2"; NS="$3"
+  if [ -n "$NS" ]; then
+    A=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$SRC" 2>/dev/null)
+    B=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$TGT" 2>/dev/null)
+  else
+    A=$(stat -Lc "%d:%i" "$SRC" 2>/dev/null)
+    B=$(stat -Lc "%d:%i" "$TGT" 2>/dev/null)
+  fi
+  [ -n "$A" ] && [ -n "$B" ] && [ "$A" = "$B" ]
+}
+
 bind_once() {
   SRC="$1"; TGT="$2"; NS="$3"
   [ -e "$TGT" ] || return 0
+  already_ours "$SRC" "$TGT" "$NS" && return 0
 
-  # Hard cap: the module may create a handful of mounts, never more.  If the
-  # counter goes over the cap something is looping, and the module steps
+  # Hard cap.  The module may create a handful of mounts, never more.  If the
+  # counter goes over the cap something is looping, and the module takes
   # itself out of the game instead of filling the mount table.
   if [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ]; then
     return 0
   fi
 
   if [ -n "$NS" ]; then
-    nsenter -t "$NS" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
-      | grep -qx "$TGT" && return 0
     nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
   else
-    awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
-      | grep -qx "$TGT" && return 0
     mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
   fi
 }
