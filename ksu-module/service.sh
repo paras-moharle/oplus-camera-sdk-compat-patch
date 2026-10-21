@@ -47,15 +47,23 @@ SZ=$(stat -c %s "$SRC" 2>/dev/null)
 
 LAST_Z=""
 LAST_PID=""
-SPIN_TICKS=0
-SPIN_SAMPLES=0
+SPIN_ACC=0
+SPIN_N=0
 
 # The camera's private-log writer (persist.sys.camera.private.log.enable) can
 # end up in a tight retry loop if it is not allowed to write /data/vendor.
-# That loop pegs a CPU core, floods the log buffer and gets the camera
-# process killed.  If the camera burns more than ~10 CPU-seconds per second
-# for 20 seconds in a row, something is spinning - turn the private log off
-# so the camera survives.  (A normal capture uses well under one CPU-second.)
+# That loop pegs one CPU core, floods the log buffer and gets the camera
+# process killed.
+#
+# Measured on this device (CPU ticks per 0.5 s sample):
+#   idle                    0 - 1
+#   during a capture       21 - 78, for ~6 s
+#   during the writer spin ~50, continuously, for minutes
+#
+# A capture and the spin look the same per sample, so the difference is the
+# DURATION: the spin never lets up.  The watchdog therefore only fires when
+# the camera has been continuously busy for 30 s and has burned more than 30
+# CPU-seconds in that time (i.e. a full core, continuously).
 watchdog_camera_spin() {
   PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
   [ -n "$PID" ] || return 0
@@ -64,18 +72,20 @@ watchdog_camera_spin() {
   [ -n "$CUR" ] || return 0
   if [ -n "$SPIN_PREV" ]; then
     D=$((CUR - SPIN_PREV))
-    if [ "$D" -gt 200 ]; then
-      SPIN_TICKS=$((SPIN_TICKS + D))
+    if [ "$D" -ge 30 ]; then
+      SPIN_ACC=$((SPIN_ACC + D))
+      SPIN_N=$((SPIN_N + 1))
     else
-      SPIN_TICKS=0
+      SPIN_ACC=0
+      SPIN_N=0
     fi
   fi
   SPIN_PREV="$CUR"
-  SPIN_SAMPLES=$((SPIN_SAMPLES + 1))
-  if [ "$SPIN_SAMPLES" -ge 20 ] && [ "$SPIN_TICKS" -gt 2000 ]; then
+  # 60 samples = 30 s of continuous busy, 1800 ticks = 30 CPU-seconds
+  if [ "$SPIN_N" -ge 60 ] && [ "$SPIN_ACC" -ge 1800 ]; then
     setprop persist.sys.camera.private.log.enable false
-    SPIN_TICKS=0
-    SPIN_SAMPLES=0
+    SPIN_ACC=0
+    SPIN_N=0
   fi
 }
 
