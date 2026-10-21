@@ -87,6 +87,15 @@ if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; th
   mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
 fi
 
+# ART keeps the dexopt output of the jar in /data/dalvik-cache.  If that
+# cache was built from the STOCK jar it would keep being used and the camera
+# would silently run the unpatched SDK.  It is dropped here, before the
+# zygote starts, so that ART always builds it from the jar that is mounted
+# now - ours.
+DEX_CACHE=/data/dalvik-cache/arm64/product@framework@com.oplus.camera.unit.sdk.jar
+rm -f "$DEX_CACHE"@classes.vdex 2>/dev/null
+rm -f "$DEX_CACHE"@classes.dex 2>/dev/null
+
 # 2) the zygote namespace - this is the one that matters.
 #
 # ART opens the jar itself (it is not a bootclasspath jar) and, when it opens
@@ -98,16 +107,27 @@ fi
 # unpatched SDK and every capture is cancelled.  The mount has to be in place
 # BEFORE the app process starts, which means before the zygote forks it.
 #
-# The prebuilt artifact is invalidated as well (an empty file over it), so
-# ART can never fall back to the stock compiled code: it re-dexopts the jar
-# that is actually mounted, i.e. ours.
-OAT_TGT=/product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
-if [ -e "$OAT_TGT" ]; then
-  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$OAT_TGT"; then
-    : > "$MODDIR/empty.vdex" 2>/dev/null
-    [ -f "$MODDIR/empty.vdex" ] && mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+# The prebuilt artifacts are invalidated as well, so ART can never fall back
+# to the stock compiled code.
+#
+# The OEM ships a prebuilt dexopt artifact for the CameraUnit SDK jar:
+#
+#     /product/framework/oat/arm64/com.oplus.camera.unit.sdk.odex
+#     /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
+#
+# They were compiled from the STOCK jar.  When ART finds them it uses them
+# and never looks at the jar - so even though the patched jar was mounted,
+# the camera ran the STOCK sdk and cancelled every capture with no error
+# anywhere.  Masking both with an empty file forces ART to extract the dex
+# from the jar that is actually mounted (ours).
+OAT_DIR=/product/framework/oat/arm64
+: > "$MODDIR/empty.bin" 2>/dev/null
+for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+  [ -e "$OAT_DIR/$f" ] || continue
+  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$OAT_DIR/$f"; then
+    mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
   fi
-fi
+done
 
 Z=""
 for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
@@ -116,9 +136,9 @@ for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
 done
 if [ -n "$Z" ]; then
   nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
-  if [ -e "$OAT_TGT" ]; then
-    nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
-  fi
+  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+    [ -e "$OAT_DIR/$f" ] && nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
+  done
 fi
 
 # ----------------------------------------------------------- framework jar

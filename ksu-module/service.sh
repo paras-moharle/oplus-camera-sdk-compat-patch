@@ -39,7 +39,7 @@
 MODDIR=/data/adb/modules/ocam_camfix
 SDK_SRC="$MODDIR/SDK-PATCHED.jar"
 SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
-OAT_TGT=/product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
+OAT_DIR=/product/framework/oat/arm64
 DEX_CACHE=/data/dalvik-cache/arm64/product@framework@com.oplus.camera.unit.sdk.jar
 PROP=persist.oplus.camera.thermal_bypass
 
@@ -50,9 +50,23 @@ if [ "$(getprop $PROP)" = "" ]; then
   setprop $PROP 1
 fi
 
-# An empty file used to invalidate the OEM's prebuilt artifact for the SDK
-# jar, so that ART can never fall back to the stock compiled code.
-[ -f "$MODDIR/empty.vdex" ] || : > "$MODDIR/empty.vdex" 2>/dev/null
+# An empty file used to invalidate the OEM's prebuilt artifacts (.odex and
+# .vdex) for the SDK jar, so that ART can never fall back to the stock
+# compiled code.
+[ -f "$MODDIR/empty.bin" ] || : > "$MODDIR/empty.bin" 2>/dev/null
+
+mask_prebuilt() {
+  # $1 = the namespace to work in ("" = the current one)
+  NS="$1"
+  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+    [ -e "$OAT_DIR/$f" ] || continue
+    if [ -n "$NS" ]; then
+      nsenter -t "$NS" -m -- mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
+    else
+      mount --bind "$MODDIR/empty.bin" "$OAT_DIR/$f" 2>/dev/null
+    fi
+  done
+}
 
 # ------------------------------------------------------------------ helpers
 
@@ -255,14 +269,14 @@ while true; do
     if [ "$Z" != "$LAST_Z" ]; then
       LAST_Z="$Z"
       nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
-      [ -e "$OAT_TGT" ] && nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+      mask_prebuilt "$Z"
       clear_dex_cache
     elif [ $((WATCH_N % 4)) -eq 0 ]; then
       if ! nsenter -t "$Z" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
            | grep -qx "$SDK_TGT"; then
         say "the zygote namespace lost the patched jar - restoring it"
         nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
-        [ -e "$OAT_TGT" ] && nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+        mask_prebuilt "$Z"
         # ART caches the dexopt output in /data/dalvik-cache.  If that cache
         # was built from the stock jar it would keep being used, so it has to
         # go - the next app that starts then dexopts the jar that is really
@@ -277,6 +291,7 @@ while true; do
   if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; then
     mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
   fi
+  mask_prebuilt ""
 
   # --- the camera app's own namespace (cosmetic) -------------------------
   PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
