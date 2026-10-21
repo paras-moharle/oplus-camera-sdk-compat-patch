@@ -42,6 +42,46 @@ import sys
 
 TARGET_REL = "com/oplus/ocs/camera/producer/mode/BaseMode.smali"
 
+# Second patch: the capture gate in ProducerImpl.
+#
+# Camera 6.070.215 wants to capture through the APS (AI multi-frame) stack.
+# On a firmware whose ODM does not ship the newer AI libraries
+# (/odm/lib64/libai_perception_scene_detect.so and friends) plus the APS
+# parameter config, the APS never finishes: the app calls
+# ProducerImpl.setApsFinishAddFrame(false) and ProducerImpl.takePicture()
+# then refuses EVERY capture with CF_APS_FINISH_ADD_FRAME - no photo at all.
+#
+# The gate is:
+#     if (mode.isAllowedToTakePicture(...) != 0)      -> allowed
+#     if (mode.isNeedAPSProcess()) {
+#         if (isApsCaptureAlgoInitializing())          -> allowed
+#     }
+#     if (mbApsFinishAddFrame || mbBurstShot)          -> allowed
+#     -> not allowed
+#
+# We make the capture always allowed.  The photo is then a plain capture
+# without the AI multi-frame, which is exactly what the camera does anyway
+# when it decides the phone is too hot.
+GATE_REL = "com/oplus/ocs/camera/producer/ProducerImpl.smali"
+# NOTE: do NOT implement this as an extra "goto" - the smali assembler
+# silently drops it (the code after it becomes unreachable).  Flipping the
+# flag read to a constant is a plain substitution that survives assembly.
+GATE_ANCHOR = """    :cond_3
+    iget-boolean v3, v0, Lcom/oplus/ocs/camera/producer/ProducerImpl;->mbApsFinishAddFrame:Z
+
+    if-nez v3, :cond_4
+"""
+GATE_PATCH = """    :cond_3
+    # ocam: the AI/APS stack cannot run on this firmware (the ODM lacks
+    # libai_perception_scene_detect.so and friends), so the camera always
+    # reports "APS did not finish" and the SDK refuses every capture with
+    # CF_APS_FINISH_ADD_FRAME.  Treat the flag as set so a plain capture
+    # (without the AI multi-frame) is taken instead.
+    const/4 v3, 0x1
+
+    if-nez v3, :cond_4
+"""
+
 # The block we replace: the int[] cast and the use of element [0].
 # (`.line` debug markers are interleaved in the real file and are preserved by
 #  the caller's line-based splice.)
@@ -230,6 +270,24 @@ def patch_file(path):
     return "patched"
 
 
+def patch_capture_gate(smali_root):
+    """Never refuse a capture because the AI/APS stack did not finish."""
+    path = os.path.join(smali_root, GATE_REL)
+    if not os.path.isfile(path):
+        die("ProducerImpl.smali not found: %s" % path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if "ocam: the AI/APS stack cannot run" in text:
+        print("  [skip] capture gate already patched")
+        return
+    if GATE_ANCHOR not in text:
+        die("could not find the capture gate in ProducerImpl.smali")
+    text = text.replace(GATE_ANCHOR, GATE_PATCH, 1)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print("  [ok] patched the capture gate in ProducerImpl.smali (APS can no longer block a capture)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -249,6 +307,14 @@ def main():
 
     print("Patching %s" % target)
     patch_file(target)
+    print("Patching %s" % GATE_REL)
+    # strip the components of TARGET_REL (com/oplus/ocs/camera/producer/mode)
+    # from the target path to get back to the smali root
+    root = target
+    for _ in TARGET_REL.split("/"):
+        root = os.path.dirname(root)
+    print("Patching %s" % GATE_REL)
+    patch_capture_gate(root)
     print("Done.")
 
 

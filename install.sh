@@ -131,6 +131,26 @@ say "class inventory identical ($(wc -l < "$WORKDIR/cls-a.txt") classes)"
 python3 "$TOOLS/dexfp.py" compare "$WORKDIR/sdk-original.jar" "$WORKDIR/pkg/classes.dex" \
   | sed 's/^/  /'
 
+# ---------------------------------------------------------------- verify
+# The smali assembler silently drops some edits (an inserted branch that makes
+# the following code unreachable is discarded), so the BUILT ARTIFACT is
+# checked, not the source tree.  Never deploy a jar that does not contain
+# both patches.
+say "verifying the built jar really contains both patches"
+rm -rf "$WORKDIR/verify"
+apktool d -f -o "$WORKDIR/verify" "$WORKDIR/sdk-patched.jar" >/dev/null 2>&1 \
+  || die "could not decode the rebuilt jar for verification"
+V_BASE="$WORKDIR/verify/smali/com/oplus/ocs/camera/producer/mode/BaseMode.smali"
+V_PROD="$WORKDIR/verify/smali/com/oplus/ocs/camera/producer/ProducerImpl.smali"
+[ -f "$V_BASE" ] || die "BaseMode.smali missing from the rebuilt jar"
+[ -f "$V_PROD" ] || die "ProducerImpl.smali missing from the rebuilt jar"
+grep -q 'instance-of v6, v1, \[J' "$V_BASE" \
+  || die "the exif long[] patch is NOT in the rebuilt jar - refusing to install"
+grep -q 'const/4 v3, 0x1' "$V_PROD" \
+  || die "the capture-gate patch is NOT in the rebuilt jar - refusing to install"
+say "both patches verified in the built artifact"
+rm -rf "$WORKDIR/verify"
+
 # ------------------------------------------------------------- deploy
 say "installing KernelSU module"
 drun "mkdir -p $KSU_DIR"
