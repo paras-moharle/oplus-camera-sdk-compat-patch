@@ -117,6 +117,20 @@ for f in "$REPO_DIR/ksu-module/post-fs-data.sh" "$REPO_DIR/ksu-module/service.sh
   fi
 done
 
+say "the watcher must be able to protect itself from a stacked mount table"
+for f in "$REPO_DIR/ksu-module/service.sh"; do
+  if grep -q "sanity_check_mounts" "$f" && grep -q "mount_count" "$f"; then
+    ok "service.sh watches the mount count and disables itself"
+  else
+    bad "service.sh has no self-protection against a stacked mount table"
+  fi
+  if grep -q 'touch "\$MODDIR/disable"' "$f"; then
+    ok "service.sh can disable itself"
+  else
+    bad "service.sh cannot disable itself"
+  fi
+done
+
 say "no raw mount may survive outside bind_once()"
 for f in "$REPO_DIR/ksu-module/post-fs-data.sh" "$REPO_DIR/ksu-module/service.sh"; do
   if python3 - "$f" <<'PYEOF'

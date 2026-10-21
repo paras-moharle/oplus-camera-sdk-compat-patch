@@ -221,6 +221,34 @@ key_watch() {
   done
 }
 
+# ------------------------------------------------------- self-protection
+#
+# The mount table is a finite resource.  A loop that binds the same path over
+# and over filled it with 6146 stacked mounts once and took the phone down.
+# bind_once() prevents that, but as a last resort this watcher watches the
+# mount count of every path it touches: if it is ever more than one, the
+# extra mounts are removed and the module disables ITSELF, so a mistake can
+# never take the phone down again.
+mount_count() {
+  awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -c "^$1$"
+}
+
+sanity_check_mounts() {
+  for t in "$SDK_TGT" "$OAT_DIR/com.oplus.camera.unit.sdk.vdex" "$OAT_DIR/com.oplus.camera.unit.sdk.odex"; do
+    c=$(mount_count "$t")
+    if [ "${c:-0}" -gt 1 ]; then
+      say "ABORT: $t has $c stacked mounts - removing the extras and disabling the module"
+      while [ "$c" -gt 1 ]; do
+        umount "$t" 2>/dev/null || break
+        c=$((c - 1))
+      done
+      touch "$MODDIR/disable" 2>/dev/null
+      say "the module has been disabled - reboot to be safe"
+      exit 0
+    fi
+  done
+}
+
 # ----------------------------------------------------------------- watchdog
 SPIN_ACC=0
 SPIN_N=0
@@ -314,6 +342,8 @@ while true; do
     mask_prebuilt "$PID"
     LAST_PID="$PID"
   fi
+
+  sanity_check_mounts
 
   sleep 0.5
 
