@@ -64,7 +64,7 @@ Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
 
 ## Install (easiest: KernelSU module)
 
-1. Download the latest **`ocam_sdkfix-v1.3.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
+1. Download the latest **`ocam_sdkfix-v1.5.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
 2. KernelSU Manager → **Modules** → **Install from storage** → pick the zip → reboot.
 3. Open the camera and take a photo.
 
