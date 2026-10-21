@@ -50,6 +50,7 @@ say "staging module files"
 cp "$MODDIR/module.prop"     "$STAGE/"
 cp "$MODDIR/post-fs-data.sh" "$STAGE/"
 cp "$MODDIR/service.sh"      "$STAGE/"
+cp "$MODDIR/sepolicy.rule"   "$STAGE/"
 cp "$PATCHED_JAR"            "$STAGE/SDK-PATCHED.jar"
 
 if [ -n "$ORIGINAL_JAR" ] && [ -f "$ORIGINAL_JAR" ]; then

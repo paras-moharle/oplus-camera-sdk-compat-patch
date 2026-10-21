@@ -1,0 +1,27 @@
+# Oplus CameraUnit SDK compat patch - SELinux rules
+# (author: Paras Moharle)
+#
+# WHY
+# ---
+# With persist.sys.camera.private.log.enable=true the camera writes a private
+# log to /data/vendor/cam_alog_<timestamp>.txt.  On this firmware the camera
+# app (domain opluscamera_app) is not allowed to write there, so the writer
+# fails and retries in a tight loop:
+#
+#   E/APS_ALOG: Failed to open directory
+#   E/APS_ALOG: Unable to open file. Please disable SELinux and restart camerahalserver. !!!
+#   E/APS_ALOG: CAM_ALOG_LIMIT, re-create file!
+#
+# That loop produced ~3000 log lines per second, pegged one CPU core, flooded
+# the logcat buffer (other logs were dropped) and eventually got the camera
+# process killed - which is exactly the "the camera works for a while and then
+# it does not" behaviour.
+#
+# These two rules let the writer open the file.  They are policy rules only:
+# no file label is changed and setenforce is never touched, so MediaTek's MKP
+# kernel-integrity module cannot be provoked into a kernel panic.
+#
+# If the private log is switched off (persist.sys.camera.private.log.enable
+# false) these rules are simply unused.
+allow opluscamera_app vendor_data_file dir { add_name write open read search getattr }
+allow opluscamera_app vendor_data_file file { create open write read getattr unlink setattr }

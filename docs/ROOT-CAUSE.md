@@ -338,7 +338,138 @@ Whether the app saw the patched jar depended on when its namespace was created
 relative to the boot-time mount - the "it works for a while and then stops"
 behaviour.
 
-`ksu-module/service.sh` now watches for the camera process and mounts the
-patched jar into the app's own namespace (measured ~250 ms after the process
-starts, before the capture classes are used).
+**Correction (2026-10-21, later in the investigation):** mounting the patched
+jar into the *camera app's* namespace does **not** work, and never could.
+ART extracts `classes.dex` from the jar when the app process starts, so by the
+time the watcher sees the process the stock dex is already in memory. The
+mount has to be in the **zygote's** namespace, because the zygote forks every
+app. See the mount-namespace section in the README.
+
+---
+
+## Appendix 2: the AI/APS gate — the real reason *no* photo was taken
+
+The exif cast above only exists in camera **6.070.215+**. The **stock
+6.020.980** app does not use it — and yet the stock app also took no photos on
+this device. That is what finally pointed at the actual gate.
+
+The CameraUnit SDK decides whether a capture is allowed like this:
+
+```java
+// ProducerImpl.takePicture()
+if (mode.isAllowedToTakePicture(...) != 0)      -> allowed
+if (mode.isNeedAPSProcess()) {                  // BaseMode: hard-coded TRUE
+    if (consumer.isApsCaptureAlgoInitializing()) -> allowed
+}
+if (mbApsFinishAddFrame || mbBurstShot)          -> allowed
+-> "takePicture, not allow take picture"        -> capture cancelled
+```
+
+`BaseMode.isNeedAPSProcess()` is hard-coded to return `true`:
+
+```smali
+.method public isNeedAPSProcess()Z
+    .locals 0
+    const/4 p0, 0x1
+    return p0
+.end method
+```
+
+so the camera *always* enters the AI/APS branch. That branch needs an AI
+stack that this firmware does not ship:
+
+```
+E APS_INTERFACE: [ALGO_ASD] loadAIPerceptionLib()  load aiPerceptionLib failed because of
+    dlopen error = dlopen failed: library "odm/lib64/libai_perception_scene_detect.so" not found!
+E APS_INTERFACE: [ALGO_FACEINFO] faceInfoLoadlib()  find cv_face_detect_ex_set_mode failed …
+E APS_INTERFACE: [ALGO_ALGO_BASE] isSupportAlgoAPI()  /odm/lib64/libUpScale.so failed …
+E APS_INTERFACE: [ALGO_ALGO_BASE] isSupportAlgoAPI()  /odm/lib64/libarcsoft_hdr_denoise_api_v4.so failed …
+E APS_INTERFACE: [ALGO_INTERFACE] ImplicitWaterMark.cpp  /odm/lib64/libImplicitWatermark.so dlopen failed …
+```
+
+plus the missing `com.oplus.aps.params.*` configuration. The APS therefore
+never finishes initialising, `isApsCaptureAlgoInitializing()` stays `true`,
+and **every** capture is cancelled with `CF_APS_FINISH_ADD_FRAME`.
+
+### Reading the log without being misled
+
+The log line is misleading in two ways:
+
+1. It prints `isApsCaptureAlgoInitializing` by **calling the method again** at
+   log time. The value it shows is not the value the branch saw.
+2. `mbApsFinishAddFrame` is re-read from a `volatile` field at log time, so
+   it can differ from the value the branch saw.
+
+The log therefore shows `isApsCaptureAlgoInitializing: false` and
+`mbApsFinishAddFrame: true` **even though the branch that fired is the one
+where the APS was still initialising**. The only way to tell what actually
+ran is to look at the disassembly.
+
+### The two new patches
+
+```smali
+; BaseMode.isNeedAPSProcess()  ->  plain capture path
+-    const/4 p0, 0x1
++    const/4 p0, 0x0
+
+; ProducerImpl.takePicture()  ->  never cancel because APS did not finish
+-    iget-boolean v3, v0, Lcom/oplus/ocs/camera/producer/ProducerImpl;->mbApsFinishAddFrame:Z
++    const/4 v3, 0x1
+```
+
+All four call sites of `isNeedAPSProcess()` are consistent with `false`:
+`KEY_NEED_APS_PROCESS` is not set, `needApsProcessor()` returns false,
+`takePicture()` skips the APS initialisation block, and no preview
+multi-frame count is attached to the request.
+
+### Result on the device
+
+With the stock **6.020.980** app and the patched SDK:
+
+```
+21:13:32  W OCAM_CaptureProcessor: onFinishAddFrame, thumbnail received before, move capture to background: 1
+21:13:36  W OCAM_CaptureProcessor: completeCapture, capture: 1, success: true
+```
+
+* photo written: `IMG20261021211332.jpg`, 2 647 644 bytes, **3072×4096**, EXIF present
+* shutter → file on disk: **2.2–2.6 s**, repeatable, also after a
+  `am force-stop` of the camera app
+
+---
+
+## Appendix 3: the camera's private log was killing the camera
+
+With `persist.sys.camera.private.log.enable=true` the camera writes a private
+log to `/data/vendor/cam_alog_*.txt`. This firmware's SELinux policy does not
+allow the camera app to write there, so the writer failed and retried in a
+tight loop:
+
+```
+E/APS_ALOG: Failed to open directory
+E/APS_ALOG: Unable to open file. Please disable SELinux and restart camerahalserver. !!!
+E/APS_ALOG: CAM_ALOG_LIMIT, re-create file!
+```
+
+Measured: **~3000 log lines per second**, **one CPU core pegged** (306 s of
+CPU in 5 minutes of process uptime), the logcat buffer wrapping so that other
+logs were dropped, and finally:
+
+```
+20:55:57.491 I/ActivityManager: Process com.oplus.camera (pid 24355) has died: svcb SVC
+```
+
+This was the *other* half of "the camera works for a while and then it does
+not": the camera was being killed by the log writer, not by the capture path.
+
+The module now ships `ksu-module/sepolicy.rule`:
+
+```
+allow opluscamera_app vendor_data_file dir { add_name write open read search getattr }
+allow opluscamera_app vendor_data_file file { create open write read getattr unlink setattr }
+```
+
+Policy rules only — no label change, no `setenforce`, so MKP cannot be
+provoked into a kernel panic. With the rules applied the camera process went
+from 100 % CPU to 0 % and the log rate from ~3000/s to one line per 3 s.
+
 

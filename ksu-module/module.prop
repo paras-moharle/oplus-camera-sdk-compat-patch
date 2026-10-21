@@ -1,6 +1,6 @@
 id=ocam_sdkfix
 name=Oplus CameraUnit SDK compat patch
-version=v1.2
-versionCode=3
+version=v1.3
+versionCode=4
 author=Paras Moharle
-description=Patches /product/framework/com.oplus.camera.unit.sdk.jar so that the "com.oplus.picture.exif.flag" capture parameter accepts long[] as well as int[]. Required by Oplus Camera 6.070.215+ on firmware that still ships the 6.020.980-era CameraUnit SDK. The patch is applied as a bind mount, the original file on disk is never modified. Disable this module after a ColorOS OTA.
+description=Patches /product/framework/com.oplus.camera.unit.sdk.jar so that (1) the "com.oplus.picture.exif.flag" capture parameter accepts long[] as well as int[], (2) ProducerImpl.takePicture() no longer cancels a capture because the AI/APS stack never finishes, and (3) BaseMode.isNeedAPSProcess() returns false so the plain capture path is used instead of the broken AI/APS one. Required by Oplus Camera 6.070.215+ on firmware that still ships the 6.020.980-era CameraUnit SDK. The patch is applied as a bind mount into the zygote mount namespace, the original file on disk is never modified. Disable this module after a ColorOS OTA.

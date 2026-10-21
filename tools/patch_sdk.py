@@ -71,6 +71,56 @@ GATE_ANCHOR = """    :cond_3
 
     if-nez v3, :cond_4
 """
+
+# Third patch: BaseMode.isNeedAPSProcess() must return false.
+#
+# THIS IS THE PATCH THAT ACTUALLY UNBLOCKS THE SHUTTER.
+#
+# ProducerImpl.takePicture() refuses every capture like this:
+#
+#     if (mode.isAllowedToTakePicture(...) != 0)          -> allowed
+#     if (mode.isNeedAPSProcess()) {
+#         if (consumer.isApsCaptureAlgoInitializing())     -> allowed
+#     }
+#     if (mbApsFinishAddFrame || mbBurstShot)              -> allowed
+#     -> "takePicture, not allow take picture"  (capture cancelled)
+#
+# BaseMode.isNeedAPSProcess() is hard-coded to `return true`, so the camera
+# always enters the APS branch.  The APS stack needs the AI libraries that
+# this firmware's ODM does not ship (/odm/lib64/libai_perception_scene_
+# detect.so, libarcsoft_hdr_denoise_api_v4.so, libImplicitWatermark.so,
+# libUpScale.so, libOPAlgoCamAIBeautyBodyDetection.so and the
+# com.oplus.aps.params.* config), so isApsCaptureAlgoInitializing() stays
+# true forever and every single capture is cancelled with
+# CF_APS_FINISH_ADD_FRAME.
+#
+# Returning false makes the camera take the plain (no-AI) capture path,
+# which is the one that works on this firmware.  All four call sites of
+# isNeedAPSProcess() are consistent with that:
+#   ProducerImpl  - KEY_NEED_APS_PROCESS = false, needApsProcessor() = false
+#   ProducerImpl  - takePicture() skips the APS initialisation block
+#   BaseMode      - no preview multi-frame count is attached to the request
+APS_REL = "com/oplus/ocs/camera/producer/mode/BaseMode.smali"
+APS_ANCHOR = """.method public isNeedAPSProcess()Z
+    .locals 0
+
+    const/4 p0, 0x1
+
+    return p0
+.end method"""
+APS_PATCH = """.method public isNeedAPSProcess()Z
+    .locals 0
+
+    # ocam: the AI/APS stack cannot run on this firmware (the ODM lacks
+    # libai_perception_scene_detect.so and friends and the
+    # com.oplus.aps.params.* config), so the APS never finishes
+    # initialising and ProducerImpl.takePicture() cancels every capture
+    # with CF_APS_FINISH_ADD_FRAME.  Tell the SDK to take the plain
+    # capture path instead.
+    const/4 p0, 0x0
+
+    return p0
+.end method"""
 GATE_PATCH = """    :cond_3
     # ocam: the AI/APS stack cannot run on this firmware (the ODM lacks
     # libai_perception_scene_detect.so and friends), so the camera always
@@ -288,6 +338,25 @@ def patch_capture_gate(smali_root):
     print("  [ok] patched the capture gate in ProducerImpl.smali (APS can no longer block a capture)")
 
 
+def patch_aps_flag(smali_root):
+    """Make the SDK take the plain capture path instead of the broken APS path."""
+    path = os.path.join(smali_root, APS_REL)
+    if not os.path.isfile(path):
+        die("BaseMode.smali not found: %s" % path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if "ocam: the AI/APS stack cannot run" in text:
+        print("  [skip] isNeedAPSProcess() already patched")
+        return
+    if APS_ANCHOR not in text:
+        die("could not find isNeedAPSProcess() in BaseMode.smali")
+    text = text.replace(APS_ANCHOR, APS_PATCH, 1)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print("  [ok] patched BaseMode.isNeedAPSProcess() -> false "
+          "(plain capture path, no broken APS)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -315,6 +384,8 @@ def main():
         root = os.path.dirname(root)
     print("Patching %s" % GATE_REL)
     patch_capture_gate(root)
+    print("Patching %s" % APS_REL)
+    patch_aps_flag(root)
     print("Done.")
 
 

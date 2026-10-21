@@ -136,7 +136,7 @@ python3 "$TOOLS/dexfp.py" compare "$WORKDIR/sdk-original.jar" "$WORKDIR/pkg/clas
 # the following code unreachable is discarded), so the BUILT ARTIFACT is
 # checked, not the source tree.  Never deploy a jar that does not contain
 # both patches.
-say "verifying the built jar really contains both patches"
+say "verifying the built jar really contains all three patches"
 rm -rf "$WORKDIR/verify"
 apktool d -f -o "$WORKDIR/verify" "$WORKDIR/sdk-patched.jar" >/dev/null 2>&1 \
   || die "could not decode the rebuilt jar for verification"
@@ -148,7 +148,18 @@ grep -q 'instance-of v6, v1, \[J' "$V_BASE" \
   || die "the exif long[] patch is NOT in the rebuilt jar - refusing to install"
 grep -q 'const/4 v3, 0x1' "$V_PROD" \
   || die "the capture-gate patch is NOT in the rebuilt jar - refusing to install"
-say "both patches verified in the built artifact"
+# The APS bypass: BaseMode.isNeedAPSProcess() must return false.  Without it
+# the camera still enters the broken AI/APS branch and cancels every capture.
+python3 - "$V_BASE" <<'PY' || die "the isNeedAPSProcess() patch is NOT in the rebuilt jar - refusing to install"
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"\.method public isNeedAPSProcess\(\)Z(.*?)\.end method", src, re.S)
+if not m:
+    sys.exit(1)
+body = m.group(1)
+sys.exit(0 if re.search(r"const/4 p0, 0x0", body) else 1)
+PY
+say "all three patches verified in the built artifact"
 rm -rf "$WORKDIR/verify"
 
 # ------------------------------------------------------------- deploy
@@ -182,22 +193,40 @@ drun "stat -c %s $KSU_DIR/SDK-PATCHED.jar > $KSU_DIR/SDK-PATCHED.jar.size"
 adb push "$SCRIPT_DIR/ksu-module/module.prop"     "$KSU_DIR/module.prop.tmp"     >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/post-fs-data.sh" "$KSU_DIR/post-fs-data.sh.tmp" >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/service.sh"      "$KSU_DIR/service.sh.tmp"      >/dev/null
+adb push "$SCRIPT_DIR/ksu-module/sepolicy.rule"   "$KSU_DIR/sepolicy.rule.tmp"   >/dev/null
 drun "mv $KSU_DIR/module.prop.tmp $KSU_DIR/module.prop"
 drun "mv $KSU_DIR/post-fs-data.sh.tmp $KSU_DIR/post-fs-data.sh"
 drun "mv $KSU_DIR/service.sh.tmp $KSU_DIR/service.sh"
+drun "mv $KSU_DIR/sepolicy.rule.tmp $KSU_DIR/sepolicy.rule"
 drun "chmod 755 $KSU_DIR/post-fs-data.sh $KSU_DIR/service.sh"
+drun "chmod 644 $KSU_DIR/sepolicy.rule"
 
 say "module installed:"
 drun "ls -l $KSU_DIR" | sed 's/^/  /'
 
 # Apply the patch immediately so the user does not have to wait for a reboot.
 # The module will re-apply it at every subsequent boot.
+#
+# The mount has to land in the ZYGOTE's mount namespace: ART extracts
+# classes.dex from the jar when an app process starts, so a mount that only
+# exists in the init namespace (or that appears after the app was forked)
+# has no effect at all - the app silently keeps the stock classes.
 say "applying the patch now (the module re-applies it at every boot)"
-if drun "mount --bind $KSU_DIR/SDK-PATCHED.jar $DEVICE_JAR" 2>/dev/null; then
-  say "patch is live - no reboot strictly required"
+drun "mount --bind $KSU_DIR/SDK-PATCHED.jar $DEVICE_JAR" 2>/dev/null || true
+for Z in $(drun "pidof zygote64" 2>/dev/null) $(drun "pidof zygote" 2>/dev/null); do
+  drun "nsenter -t $Z -m -- mount --bind $KSU_DIR/SDK-PATCHED.jar $DEVICE_JAR" 2>/dev/null || true
+  break
+done
+if drun "nsenter -t \$(pidof zygote64 | cut -d' ' -f1) -m -- md5sum $DEVICE_JAR" 2>/dev/null | grep -q .; then
+  say "patch is live in the zygote namespace - no reboot strictly required"
 else
-  warn "could not apply the bind mount now, a reboot is required"
+  warn "could not apply the bind mount to the zygote namespace, a reboot is required"
 fi
+
+# The camera app caches the extracted dex for the lifetime of the process, so
+# it has to be restarted to pick the patched classes up.
+say "restarting the camera app so it loads the patched classes"
+drun "am force-stop com.oplus.camera" 2>/dev/null || true
 
 cat <<EOF
 
