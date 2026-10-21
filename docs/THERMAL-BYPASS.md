@@ -75,20 +75,39 @@ Patch the framework that owns the temperature source:
     getThermalStatus()I    -> real horae level
 ```
 
-For the **camera process only** (uid detected from the device) they now return
-a capped value (30 °C / level 0). Every other process keeps seeing the real
-values, so battery charging limits, game mode and the thermal governor are
-unaffected.
+For the **camera process only** (uid detected from the device) they return
+**two different values, on purpose** — they pull in opposite directions:
+
+| method | value returned | what the camera does with it |
+|---|---|---|
+| `getCurrentThermal()` | **30.0 °C** (low) | compared against the camera's own capture threshold (**41 °C**). Below it → the capture is **not deferred** → no 3–6 s shutter |
+| `getThermalStatus()` | **13** (high) | `max(config, status) >= 13` in `hb/u.W1()` → "too hot" → the camera **does not use the AI/EAP (APS multi-frame) capture path** |
+
+The second one is the subtle part. The AI/EAP capture path is **broken on this
+firmware** (the `aisubsystem` stack never completes → `onCaptureFailed` →
+`CF_APS_FINISH_ADD_FRAME` → *every* capture is rejected, no photo at all).
+Reporting a *low* status makes the camera insist on that broken path — so the
+status has to be reported **high** while the temperature is reported **low**.
 
 ```smali
     invoke-static {}, Landroid/os/Process;->myUid()I
     move-result v0
     const/16 v1, 0x27ab            # uid of com.oplus.camera
-    if-ne v0, v1, :ocam_no_thermal_bypass
-    const/high16 v0, 0x41f00000    # 30.0f
+    if-eq v0, v1, :ocam_thermal_bypass
+    goto :ocam_no_thermal_bypass
+    :ocam_thermal_bypass
+    const/high16 v0, 0x41f00000    # getCurrentThermal() -> 30.0f
     return v0
     :ocam_no_thermal_bypass
+    # ... and in getThermalStatus():
+    :ocam_thermal_bypass_status
+    const/16 v0, 0xd               # getThermalStatus() -> 13
+    return v0
 ```
+
+The **AI unit (`com.oplus.aiunit`) is deliberately not patched** — it must keep
+seeing the real thermal state, otherwise its own inference refuses to run
+(`AIUnit-Plugin-DetectEngine: runByByte onFailed`).
 
 ## How it is deployed
 

@@ -58,7 +58,7 @@ def die(msg):
     sys.exit(1)
 
 
-def patch_method(lines, method_sig, uid, label, body, marker):
+def patch_method(lines, method_sig, uids, label_hit, label_miss, body, marker):
     """Insert a UID-guarded early return at the start of a method."""
     start = None
     for i, l in enumerate(lines):
@@ -90,11 +90,18 @@ def patch_method(lines, method_sig, uid, label, body, marker):
         "    # --- camera thermal bypass (patched) ---",
         "    invoke-static {}, Landroid/os/Process;->myUid()I",
         "    move-result v0",
-        "    const/16 v1, 0x%x" % uid,
-        "    if-ne v0, v1, %s" % label,
+    ]
+    for uid in uids:
+        block += [
+            "    const/16 v1, 0x%x" % uid,
+            "    if-eq v0, v1, %s" % label_hit,
+        ]
+    block += [
+        "    goto %s" % label_miss,
+        "    %s" % label_hit,
         "    %s" % body,
         "    %s" % marker,
-        "    %s" % label,
+        "    %s" % label_miss,
         "    # --- end camera thermal bypass ---",
         "",
     ]
@@ -106,15 +113,24 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("smali_root", help="decoded framework root (contains com/oplus/...)")
-    ap.add_argument("--uid", type=int, default=10155,
-                    help="uid of the process that gets the capped values "
-                         "(10155 = com.oplus.camera)")
+    ap.add_argument("--uid", action="append", type=int, default=None,
+                    help="uid of a process that gets the capped values; repeatable. "
+                         "Default: 10155 (com.oplus.camera) only - the AI unit "
+                         "must keep seeing the real temperature")
     ap.add_argument("--temp", default="30.0",
-                    help="temperature reported to that process, in degC")
+                    help="temperature reported to that process, in degC. Must stay "
+                         "below the camera's own capture threshold (41 degC) so "
+                         "captures are not deferred")
+    ap.add_argument("--status", type=int, default=13,
+                    help="thermal status reported to that process. The camera "
+                         "only uses the AI/EAP capture path when this is < 13; "
+                         "13+ makes it take the plain capture path, which is the "
+                         "one that works on this firmware")
     ap.add_argument("--check", action="store_true",
                     help="only report whether the patch is present")
     args = ap.parse_args()
 
+    uids = args.uid if args.uid else [10155]
     path = os.path.join(args.smali_root, TARGET)
     if not os.path.isfile(path):
         die("not found: %s" % path)
@@ -137,17 +153,19 @@ def main():
     body_f = "const/high16 v0, 0x%x" % temp_bits
 
     lines = patch_method(
-        lines, "getCurrentThermal()F", args.uid,
-        ":ocam_no_thermal_bypass", body_f, "return v0")
+        lines, "getCurrentThermal()F", uids,
+        ":ocam_thermal_bypass", ":ocam_no_thermal_bypass",
+        body_f, "return v0")
     lines = patch_method(
-        lines, "getThermalStatus()I", args.uid,
-        ":ocam_no_thermal_bypass_status", "const/4 v0, 0x0", "return v0")
+        lines, "getThermalStatus()I", uids,
+        ":ocam_thermal_bypass_status", ":ocam_no_thermal_bypass_status",
+        "const/16 v0, 0x%x" % args.status, "return v0")
 
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
 
-    print("  [ok] patched %s for uid %d (temp=%s degC, status=0)"
-          % (TARGET, args.uid, args.temp))
+    print("  [ok] patched %s for uid(s) %s (temp=%s degC, status=%d)"
+          % (TARGET, ",".join(str(u) for u in uids), args.temp, args.status))
     return 0
 
 

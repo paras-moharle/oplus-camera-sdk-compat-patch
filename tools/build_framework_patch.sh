@@ -23,7 +23,6 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 ORIGINAL="${1:-}"
 OUTDIR="${2:-$REPO_DIR/release/thermal}"
-UID_ARG="${CAMERA_UID:-}"
 
 [ -n "$ORIGINAL" ] || { echo "usage: $0 <original-ofw.jar> [outdir]" >&2; exit 2; }
 [ -f "$ORIGINAL" ] || { echo "no such file: $ORIGINAL" >&2; exit 1; }
@@ -35,13 +34,25 @@ command -v apktool  >/dev/null || die "apktool not found (https://ibotpeaches.gi
 command -v python3  >/dev/null || die "python3 not found"
 command -v zipalign >/dev/null || die "zipalign not found (Android SDK build-tools)"
 
-# the camera's uid, unless the caller knows better
-if [ -z "$UID_ARG" ]; then
-  UID_ARG=$(adb shell 'pm list packages -U com.oplus.camera' 2>/dev/null \
-            | tr -d '\r' | sed -n 's/.*uid:\([0-9]*\).*/\1/p' | head -1)
-  [ -n "$UID_ARG" ] || UID_ARG=10155
+# The uids that must see the capped temperature:
+#   com.oplus.camera  - the camera app itself
+# The AI unit (com.oplus.aiunit) is deliberately NOT in the list: it must keep
+# seeing the real thermal state, otherwise its own inference refuses to run.
+# Set AIUNIT_UID to include it as well.
+# Detected from the device unless CAMERA_UID / AIUNIT_UID are given.
+UID_ARGS=()
+if [ -n "${CAMERA_UID:-}" ]; then
+  UID_ARGS+=(--uid "$CAMERA_UID")
+else
+  CU=$(adb shell 'pm list packages -U' 2>/dev/null | tr -d '\r' \
+       | sed -n 's/^package:com\.oplus\.camera uid:\([0-9]*\).*/\1/p' | head -1)
+  [ -n "$CU" ] && UID_ARGS+=(--uid "$CU")
 fi
-say "camera uid: $UID_ARG"
+if [ -n "${AIUNIT_UID:-}" ]; then
+  UID_ARGS+=(--uid "$AIUNIT_UID")
+fi
+[ ${#UID_ARGS[@]} -eq 0 ] && UID_ARGS=(--uid 10155)
+say "uids to bypass: ${UID_ARGS[*]}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -51,7 +62,7 @@ say "decoding $(basename "$ORIGINAL")"
 apktool d -f -o "$WORK/ofw" "$ORIGINAL" >/dev/null 2>&1 || die "apktool decode failed"
 
 say "patching the thermal helper"
-python3 "$SCRIPT_DIR/patch_thermal_bypass.py" "$WORK/ofw/smali" --uid "$UID_ARG"
+python3 "$SCRIPT_DIR/patch_thermal_bypass.py" "$WORK/ofw/smali" "${UID_ARGS[@]}"
 
 say "rebuilding"
 apktool b -f "$WORK/ofw" -o "$WORK/patched.apk" >/dev/null 2>&1 || die "apktool build failed"
