@@ -7,7 +7,7 @@
 #   Takes the patched SDK jar (and the pristine original) and packages them
 #   together with the module scripts into
 #
-#       release/ocam_sdkfix-<version>.zip
+#       release/<module-id>-<version>.zip
 #
 #   The zip is what you flash in KernelSU Manager -> Modules -> Install from
 #   storage.  Nothing is downloaded and nothing proprietary is committed to
@@ -15,11 +15,14 @@
 #   device with install.sh.
 #
 # Usage:
-#   tools/build_release.sh <patched.jar> [original.jar]
+#   tools/build_release.sh <patched-sdk.jar> [original-sdk.jar] [patched-ofw.jar]
 #
-#   patched.jar   the rebuilt SDK jar (install.sh leaves it in the workdir)
-#   original.jar  the pristine SDK jar (optional; only kept in the module for
-#                 reference / manual rollback)
+#   patched-sdk.jar  the rebuilt CameraUnit SDK jar
+#   original-sdk.jar the pristine CameraUnit SDK jar (optional; only kept in
+#                    the module for reference / manual rollback)
+#   patched-ofw.jar  the rebuilt oplus-framework.jar (the thermal bypass).
+#                    Optional - without it the module still works, the thermal
+#                    bypass is simply not active.
 #
 set -euo pipefail
 
@@ -30,6 +33,7 @@ OUTDIR="$REPO_DIR/release"
 
 PATCHED_JAR="${1:-}"
 ORIGINAL_JAR="${2:-}"
+PATCHED_OFW="${3:-}"
 
 [ -n "$PATCHED_JAR" ] || { echo "usage: $0 <patched.jar> [original.jar]" >&2; exit 2; }
 [ -f "$PATCHED_JAR" ] || { echo "no such file: $PATCHED_JAR" >&2; exit 1; }
@@ -40,6 +44,8 @@ die()  { printf '\033[1;31mXX\033[0m %s\n' "$*" >&2; exit 1; }
 
 VERSION="$(sed -n 's/^version=//p' "$MODDIR/module.prop" | tr -d '\r')"
 [ -n "$VERSION" ] || die "cannot read version= from $MODDIR/module.prop"
+MODID="$(sed -n 's/^id=//p' "$MODDIR/module.prop" | tr -d '\r')"
+[ -n "$MODID" ] || die "cannot read id= from $MODDIR/module.prop"
 
 say "module version: $VERSION"
 mkdir -p "$OUTDIR"
@@ -59,21 +65,30 @@ else
   warn "no original jar given - the module will not carry a reference copy"
 fi
 
+if [ -n "$PATCHED_OFW" ] && [ -f "$PATCHED_OFW" ]; then
+  cp "$PATCHED_OFW" "$STAGE/PATCHED-ofw.jar"
+else
+  warn "no patched framework jar given - the thermal bypass will not be active"
+fi
+
 # The boot scripts compare this against the jar before mounting it.
 stat -c %s "$STAGE/SDK-PATCHED.jar" > "$STAGE/SDK-PATCHED.jar.size"
+if [ -f "$STAGE/PATCHED-ofw.jar" ]; then
+  stat -c %s "$STAGE/PATCHED-ofw.jar" > "$STAGE/PATCHED-ofw.jar.size"
+fi
 
 chmod 755 "$STAGE/post-fs-data.sh" "$STAGE/service.sh"
 
-say "zip: $OUTDIR/ocam_sdkfix-$VERSION.zip"
-rm -f "$OUTDIR/ocam_sdkfix-$VERSION.zip"
-( cd "$STAGE" && zip -q -r -X "$OUTDIR/ocam_sdkfix-$VERSION.zip" . ) \
+say "zip: $OUTDIR/$MODID-$VERSION.zip"
+rm -f "$OUTDIR/$MODID-$VERSION.zip"
+( cd "$STAGE" && zip -q -r -X "$OUTDIR/$MODID-$VERSION.zip" . ) \
   || die "zip failed"
 
 say "contents:"
-unzip -l "$OUTDIR/ocam_sdkfix-$VERSION.zip" | sed 's/^/  /'
+unzip -l "$OUTDIR/$MODID-$VERSION.zip" | sed 's/^/  /'
 
 say "sha256:"
-sha256sum "$OUTDIR/ocam_sdkfix-$VERSION.zip" | sed 's/^/  /'
+sha256sum "$OUTDIR/$MODID-$VERSION.zip" | sed 's/^/  /'
 
 cat <<EOF
 
@@ -81,5 +96,8 @@ $(printf '\033[1;32m*** DONE ***\033[0m')
 
 Flash it in KernelSU Manager -> Modules -> Install from storage, then reboot.
 
-  adb shell mount | grep camera.unit.sdk     # verify after the reboot
+  adb shell su -c 'nsenter -t \$(pidof zygote64) -m -- md5sum /product/framework/com.oplus.camera.unit.sdk.jar'
+
+  hold volume-down for 2 s  ->  toggle the thermal bypass
+  hold volume-up   for 2 s  ->  show the state
 EOF

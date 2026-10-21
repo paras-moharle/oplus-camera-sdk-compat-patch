@@ -1,4 +1,4 @@
-# The 3–6 second shutter — camera thermal bypass (`ocam_thermalfix`)
+# The 3–6 second shutter — camera thermal bypass (part of `ocam_camfix`)
 
 **Optional module.** Only needed if your camera takes photos but they arrive
 **several seconds** after you press the shutter, the preview is choppy, or
@@ -182,30 +182,53 @@ stat -Lc '%d:%i' /data/adb/modules/ocam_thermalfix/PATCHED-ofw.jar
 
 ## Install
 
-```bash
-# together with the SDK patch
-./install.sh --with-thermal-fix
+The thermal bypass is part of the **same module** as the SDK patch:
 
-# or on its own
-./install_thermalfix.sh
+```bash
+./install.sh                # both fixes, one module
 
 # or flash the prebuilt zip
-#   release/ocam_thermalfix-v1.0.zip
+#   release/ocam_camfix-v2.0.zip
 #   KernelSU Manager -> Modules -> Install from storage -> reboot
 ```
 
-Build it yourself for another device:
+Build the framework jar yourself for another device:
 
 ```bash
 adb pull /system/framework/oplus-framework.jar
 tools/build_framework_patch.sh oplus-framework.jar     # decode, patch, rebuild, verify
-tools/build_thermalfix_zip.sh release/thermal/patched-ofw.jar \
-                            release/thermal/original-ofw.jar
 ```
+
+## Switching it on and off at run time
+
+`oplus-framework.jar` is a **bootclasspath** jar: the zygote opens it once at
+boot and keeps it mapped, so the mount over it cannot be changed while the
+system is running —
+
+```bash
+adb shell su -c "umount /system/framework/oplus-framework.jar"
+# umount: /system/framework/oplus-framework.jar: Device or resource busy
+```
+
+The patched class therefore reads a **system property on every call**:
+
+```
+persist.oplus.camera.thermal_bypass      1 = on (default), 0 = off
+```
+
+and the module flips it from the volume keys:
+
+| Gesture | Action |
+|---|---|
+| hold **volume-down** for 2 s | toggle the thermal bypass |
+| hold **volume-up** for 2 s | show the state and the real skin temperature |
+
+The property is `persist.*`, so the choice survives a reboot.
 
 Verify:
 
 ```bash
+adb shell getprop persist.oplus.camera.thermal_bypass   # 1 or 0
 adb shell mount | grep oplus-framework       # patched jar bound in
 adb shell ls -Z /system/framework/oplus-framework.jar   # u:object_r:system_file:s0
 dumpsys horae | grep Temp                     # real value, unchanged for other apps
@@ -248,7 +271,7 @@ the same phone (the AE/exposure values in the logcat are identical).
 
 The two modules are independent and solve different problems:
 
-| | `ocam_sdkfix` | `ocam_thermalfix` |
+| | SDK patch | thermal bypass |
 |---|---|---|
 | Problem | camera 6.070.215 takes **no photo** at all | camera takes photos, but takes **3–6 s** and feels laggy |
 | Cause | `ClassCastException` on the exif flag (`long[]` vs `int[]`) | capture temperature threshold 41 °C vs. a phone that idles at 41–44 °C |

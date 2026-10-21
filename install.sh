@@ -1,46 +1,48 @@
 #!/usr/bin/env bash
 #
-# install.sh - Patch the Oplus CameraUnit SDK on the device so that camera
-#              6.070.215 (and newer) can take photos again.
+# install.sh - Install the "ocam_camfix" KernelSU module: the CameraUnit SDK
+#              patch + the camera thermal bypass, in ONE module.
 #
 # WHAT IT DOES
 # ------------
 #   1. pulls /product/framework/com.oplus.camera.unit.sdk.jar off the device
-#   2. decodes it with apktool
-#   3. applies tools/patch_sdk.py  (one method, accepts int[] and long[])
-#   4. rebuilds the jar and verifies the class/method inventory is unchanged
-#   5. installs a KernelSU module that bind-mounts the patched jar over the
-#      original at every boot
+#   2. decodes it with apktool and applies tools/patch_sdk.py
+#        - the exif flag accepts long[] as well as int[]
+#        - isNeedAPSProcess() returns false (the AI/APS stack cannot run here)
+#        - the capture gate can no longer cancel a capture
+#   3. rebuilds the jar and verifies the class/method inventory is unchanged
+#   4. pulls /system/framework/oplus-framework.jar and patches
+#      com/oplus/util/OplusHoraeThermalHelper so the CAMERA PROCESS ONLY sees
+#      a capped skin temperature (30 degC / thermal level 13)
+#   5. installs ONE KernelSU module that bind-mounts both patched jars over
+#      the originals at every boot, and that lets the thermal bypass be
+#      switched on and off at run time with the volume keys
 #
-# The original jar is NEVER modified.  The patch is a bind mount, so the
-# stock file stays byte-identical on disk and removing the module restores
-# the stock behaviour instantly.
+# Neither original jar is EVER modified.  The patches are bind mounts, so the
+# stock files stay byte-identical on disk and removing the module restores the
+# stock behaviour instantly.
 #
 # Usage:
 #   ./install.sh                    # install + reboot
 #   ./install.sh --no-reboot        # install, reboot yourself later
 #   ./install.sh --force            # allow overwriting an existing install
-#   ./install.sh --with-thermal-fix # ALSO install the optional camera thermal
-#                                   # bypass (see docs/THERMAL-BYPASS.md)
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLS="$SCRIPT_DIR/tools"
-KSU_DIR="/data/adb/modules/ocam_sdkfix"
+KSU_DIR="/data/adb/modules/ocam_camfix"
 DEVICE_JAR="/product/framework/com.oplus.camera.unit.sdk.jar"
-DEVICE_JAR_ADAPTER="/product/framework/com.oplus.camera.unit.sdk.adapter.jar"
+DEVICE_OFW="/system/framework/oplus-framework.jar"
 WORKDIR="${WORKDIR:-$(mktemp -d /tmp/ocam-patch-XXXXXX)}"
 
 FORCE=0
 REBOOT=1
-THERMAL=0
 for a in "$@"; do
   case "$a" in
     --force) FORCE=1 ;;
     --no-reboot) REBOOT=0 ;;
-    --with-thermal-fix) THERMAL=1 ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -162,15 +164,53 @@ PY
 say "all three patches verified in the built artifact"
 rm -rf "$WORKDIR/verify"
 
+# ------------------------------------------------------- framework jar
+# The thermal bypass: the camera app defers every capture while the skin
+# temperature is above the hard-coded 41 degC limit, and the patched
+# OplusHoraeThermalHelper reports 30 degC to the camera process only.
+#
+# The bypass can be switched on and off at run time (volume-down for 2 s),
+# because the patched class reads a system property on every call.
+say "pulling the framework jar"
+OFW_BACKUP="/data/local/tmp/ocam-ofw-ORIGINAL.jar"
+if [ "$FORCE" -eq 0 ] && drun "test -f $OFW_BACKUP" | grep -q .; then
+  adb pull "$OFW_BACKUP" "$WORKDIR/original-ofw.jar" >/dev/null
+  say "using the backed-up pristine framework jar"
+else
+  adb pull "$DEVICE_OFW" "$WORKDIR/original-ofw.jar" >/dev/null
+  drun "cp $DEVICE_OFW $OFW_BACKUP" 2>/dev/null || true
+fi
+[ -s "$WORKDIR/original-ofw.jar" ] || die "failed to pull $DEVICE_OFW"
+
+say "building the patched framework jar"
+"$TOOLS/build_framework_patch.sh" "$WORKDIR/original-ofw.jar" "$WORKDIR/ofwout"
+OFW_PATCHED="$WORKDIR/ofwout/patched-ofw.jar"
+[ -f "$OFW_PATCHED" ] || die "the patched framework jar was not built"
+
+say "verifying the built framework jar contains the switch"
+rm -rf "$WORKDIR/ofwverify"
+apktool d -f -o "$WORKDIR/ofwverify" "$OFW_PATCHED" >/dev/null 2>&1 \
+  || die "could not decode the patched framework jar"
+OFW_SMALI="$WORKDIR/ofwverify/smali/com/oplus/util/OplusHoraeThermalHelper.smali"
+[ -f "$OFW_SMALI" ] || die "OplusHoraeThermalHelper.smali missing from the rebuilt jar"
+grep -q "persist.oplus.camera.thermal_bypass" "$OFW_SMALI" \
+  || die "the thermal bypass switch is NOT in the rebuilt jar - refusing to install"
+grep -q "getBoolean" "$OFW_SMALI" \
+  || die "the thermal bypass switch is NOT in the rebuilt jar - refusing to install"
+say "the run-time switch is in the built artifact"
+rm -rf "$WORKDIR/ofwverify"
+
 # ------------------------------------------------------------- deploy
 say "installing KernelSU module"
 drun "mkdir -p $KSU_DIR"
 adb push "$WORKDIR/sdk-patched.jar" "$KSU_DIR.tmp" >/dev/null
 drun "cp $KSU_DIR.tmp $KSU_DIR/SDK-PATCHED.jar && rm -f $KSU_DIR.tmp"
 drun "cp $BACKUP $KSU_DIR/SDK-ORIGINAL.jar"
+adb push "$OFW_PATCHED" "$KSU_DIR.tmp" >/dev/null
+drun "cp $KSU_DIR.tmp $KSU_DIR/PATCHED-ofw.jar && rm -f $KSU_DIR.tmp"
 # DAC permissions only.
-drun "chown root:root $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
-drun "chmod 755 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
+drun "chown root:root $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar $KSU_DIR/PATCHED-ofw.jar" 2>/dev/null || true
+drun "chmod 755 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar $KSU_DIR/PATCHED-ofw.jar" 2>/dev/null || true
 # The SELinux label is set ONCE, here at install time - never from a boot-time
 # script.  MediaTek's MKP kernel-integrity module hashes the SELinux state and
 # panics the kernel (kernel panic, boot loop) when a label changes while the
@@ -181,14 +221,20 @@ drun "chmod 755 $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/SDK-ORIGINAL.jar"
 # same on every firmware version.
 ORIG_CTX=$(drun "ls -Z $DEVICE_JAR" 2>/dev/null | awk '{print $1}')
 [ -n "$ORIG_CTX" ] || ORIG_CTX="u:object_r:system_file:s0"
+OFW_CTX=$(drun "ls -Z $DEVICE_OFW" 2>/dev/null | awk '{print $1}')
+[ -n "$OFW_CTX" ] || OFW_CTX="u:object_r:system_file:s0"
 drun "chcon $ORIG_CTX $KSU_DIR/SDK-PATCHED.jar" 2>/dev/null || true
 drun "chcon $ORIG_CTX $KSU_DIR/SDK-ORIGINAL.jar" 2>/dev/null || true
-say "label set to $ORIG_CTX (install time only, never at boot)"
+drun "chcon $OFW_CTX $KSU_DIR/PATCHED-ofw.jar" 2>/dev/null || true
+say "labels set to $ORIG_CTX / $OFW_CTX (install time only, never at boot)"
 
 # Record the exact size of the patched jar.  The boot scripts compare it
 # against the file before bind-mounting it, so a truncated / partially written
 # jar can never shadow the real SDK.
 drun "stat -c %s $KSU_DIR/SDK-PATCHED.jar > $KSU_DIR/SDK-PATCHED.jar.size"
+drun "stat -c %s $KSU_DIR/PATCHED-ofw.jar > $KSU_DIR/PATCHED-ofw.jar.size"
+drun "sha256sum $KSU_DIR/SDK-PATCHED.jar | cut -d' ' -f1 > $KSU_DIR/SDK-PATCHED.jar.sha256"
+drun "sha256sum $KSU_DIR/PATCHED-ofw.jar | cut -d' ' -f1 > $KSU_DIR/PATCHED-ofw.jar.sha256"
 
 adb push "$SCRIPT_DIR/ksu-module/module.prop"     "$KSU_DIR/module.prop.tmp"     >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/post-fs-data.sh" "$KSU_DIR/post-fs-data.sh.tmp" >/dev/null
@@ -223,6 +269,25 @@ else
   warn "could not apply the bind mount to the zygote namespace, a reboot is required"
 fi
 
+# The framework jar is a BOOTCLASSPATH jar: the zygote opens it once at boot
+# and keeps it mapped, so the mount over it can only be created at boot time
+# (unmounting it later fails with "Device or resource busy").  If the mount
+# is not there yet, a reboot is needed for the thermal bypass to become
+# active - the switch property itself can be flipped at any time.
+if drun "awk '{print \$5}' /proc/self/mountinfo | grep -qx $DEVICE_OFW" | grep -q .; then
+  say "the thermal bypass is already mounted"
+else
+  warn "the thermal bypass needs a reboot to become active (bootclasspath jar)"
+fi
+
+# Remove the two old single-purpose modules if they are still there.
+for OLD in ocam_sdkfix ocam_thermalfix; do
+  if drun "test -d /data/adb/modules/$OLD" | grep -q .; then
+    say "removing the old module $OLD (replaced by $KSU_DIR)"
+    drun "rm -rf /data/adb/modules/$OLD"
+  fi
+done
+
 # The camera app caches the extracted dex for the lifetime of the process, so
 # it has to be restarted to pick the patched classes up.
 say "restarting the camera app so it loads the patched classes"
@@ -232,20 +297,15 @@ cat <<EOF
 
 $(printf '\033[1;32m*** DONE ***\033[0m')
 
-The patched SDK is installed.
+The camera fix is installed (SDK patch + thermal bypass, one module).
 
-  verify:  adb shell mount | grep camera.unit.sdk
+  verify:  adb shell su -c 'nsenter -t $(pidof zygote64) -m -- md5sum /product/framework/com.oplus.camera.unit.sdk.jar'
+  switch:  hold volume-down for 2 s  -> toggle the thermal bypass
+           hold volume-up   for 2 s  -> show the state and the real temperature
   rollback: ./uninstall.sh
 
-A reboot is recommended so that every process picks up the patched jar.
+A reboot is recommended so that every process picks up the patched jars.
 EOF
-
-if [ "$THERMAL" -eq 1 ]; then
-  say
-  say "installing the optional camera thermal bypass as well"
-  # never reboot from here - install.sh does the single reboot at the end
-  "$SCRIPT_DIR/install_thermalfix.sh" --no-reboot
-fi
 
 if [ "$REBOOT" -eq 1 ]; then
   say "rebooting"

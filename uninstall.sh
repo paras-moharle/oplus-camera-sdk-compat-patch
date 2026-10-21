@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
 #
-# uninstall.sh - Remove the CameraUnit SDK compat patch and restore the
-#                stock (unpatched) CameraUnit SDK.
+# uninstall.sh - Remove the "ocam_camfix" KernelSU module and restore the
+#                stock CameraUnit SDK and the stock oplus-framework.jar.
 #
-# The patch is only ever a bind mount, so removing the module and rebooting
-# restores the original jar exactly - the file on disk was never modified.
+# Both patches are only ever bind mounts, so removing the module and rebooting
+# restores the original files exactly - nothing on disk was ever modified.
 #
 # Usage:
-#   ./uninstall.sh              # remove the SDK patch
-#   ./uninstall.sh --thermal    # also remove the optional camera thermal bypass
+#   ./uninstall.sh              # remove the module
+#   ./uninstall.sh --no-reboot  # remove it, reboot yourself later
 #
 set -euo pipefail
 
-KSU_DIR="/data/adb/modules/ocam_sdkfix"
-THERMAL_DIR="/data/adb/modules/ocam_thermalfix"
+KSU_DIR="/data/adb/modules/ocam_camfix"
 TARGET="/product/framework/com.oplus.camera.unit.sdk.jar"
 FW_TARGET="/system/framework/oplus-framework.jar"
 REBOOT=1
-THERMAL=0
 
 for a in "$@"; do
   case "$a" in
     --no-reboot) REBOOT=0 ;;
-    --thermal) THERMAL=1 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -42,30 +39,32 @@ fi
 
 say "unmounting any active overlay"
 drun "umount $TARGET" 2>/dev/null || true
+drun "umount $FW_TARGET" 2>/dev/null || true
 
 say "removing KernelSU module $KSU_DIR"
 drun "rm -rf $KSU_DIR"
 
-if [ "$THERMAL" -eq 1 ]; then
-  say "unmounting the camera thermal bypass overlay"
-  drun "umount $FW_TARGET" 2>/dev/null || true
-  say "removing KernelSU module $THERMAL_DIR"
-  drun "rm -rf $THERMAL_DIR"
-  say "confirming the stock framework jar is back in place"
-  drun "ls -l $FW_TARGET" | sed 's/^/  /'
-  drun "sha256sum $FW_TARGET" 2>/dev/null | sed 's/^/  /' || true
-fi
+# The two single-purpose modules that came before the combined one.
+for OLD in ocam_sdkfix ocam_thermalfix; do
+  if drun "test -d /data/adb/modules/$OLD" | grep -q .; then
+    say "removing the old module /data/adb/modules/$OLD"
+    drun "rm -rf /data/adb/modules/$OLD"
+  fi
+done
 
-say "confirming the stock jar is back in place"
+say "confirming the stock jars are back in place"
 drun "ls -l $TARGET" | sed 's/^/  /'
 drun "sha256sum $TARGET" 2>/dev/null | sed 's/^/  /' || true
+drun "ls -l $FW_TARGET" | sed 's/^/  /'
+drun "sha256sum $FW_TARGET" 2>/dev/null | sed 's/^/  /' || true
 
 cat <<EOF
 
 $(printf '\033[1;32m*** DONE ***\033[0m')
 
-The stock CameraUnit SDK is restored.  A reboot is recommended so that any
-already-running processes pick up the original jar.
+The stock CameraUnit SDK and the stock oplus-framework.jar are restored.  A
+reboot is recommended so that any already-running processes pick up the
+original files.
 
   adb reboot
 EOF

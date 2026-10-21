@@ -35,7 +35,7 @@ Full write-up: **[docs/ROOT-CAUSE.md](docs/ROOT-CAUSE.md)**.
 
 ---
 
-## Optional: the 3–6 second shutter
+## The 3–6 second shutter (part of the same module)
 
 **Symptom:** photos *do* arrive, but **3–6 seconds** after you press the
 shutter; the preview stutters; video recording is refused when the phone is
@@ -50,12 +50,9 @@ lets go. The threshold cannot be changed by configuration (the OEM code has a
 key/lookup type mismatch that always falls back to the hard-coded value).
 
 **Fix:** patch `oplus-framework.jar` so that **only the camera process** sees a
-capped temperature. Every other app keeps the real one.
-
-```bash
-./install.sh --with-thermal-fix     # SDK patch + thermal bypass
-./install_thermalfix.sh             # thermal bypass only
-```
+capped temperature. Every other app keeps the real one. It is part of the same
+module as the SDK patch, and it can be **switched on and off at run time with
+the volume keys** (see *The thermal bypass has a runtime switch* above).
 
 Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
 
@@ -64,9 +61,11 @@ Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
 
 ## Install (easiest: KernelSU module)
 
-1. Download the latest **`ocam_sdkfix-v1.5.zip`** from the [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page.
-2. KernelSU Manager → **Modules** → **Install from storage** → pick the zip → reboot.
-3. Open the camera and take a photo.
+One module does both fixes. Download **`ocam_camfix-v2.0.zip`** from the
+[Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page:
+
+1. KernelSU Manager → **Modules** → **Install from storage** → pick the zip → reboot.
+2. Open the camera and take a photo.
 
 <details>
 <summary>Or build &amp; install from source (recommended — no proprietary binary is downloaded)</summary>
@@ -74,14 +73,44 @@ Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
 ```bash
 git clone https://github.com/paras-moharle/oplus-camera-sdk-compat-patch.git
 cd oplus-camera-sdk-compat-patch
-./install.sh                # pulls your device's own SDK jar, patches it, installs the module, reboots
+./install.sh                # pulls your device's own jars, patches them, installs the module, reboots
 ```
 
-The jar is always built **from the target device's own**
-`/product/framework/com.oplus.camera.unit.sdk.jar`, so no OEM binary is
-distributed. `install.sh` refuses to clobber an existing install unless you
-pass `--force`; `--no-reboot` skips the reboot.
+Both jars are always built **from the target device's own**
+`/product/framework/com.oplus.camera.unit.sdk.jar` and
+`/system/framework/oplus-framework.jar`, so no OEM binary is distributed.
+`install.sh` refuses to clobber an existing install unless you pass
+`--force`; `--no-reboot` skips the reboot.
 </details>
+
+### The thermal bypass has a runtime switch
+
+The camera defers every capture while the phone is warmer than 41 °C. The
+module hides that from the camera process only — and it can be **switched on
+and off while the phone is running**:
+
+| Gesture | Action |
+|---|---|
+| **hold volume-down for 2 s** | toggle the thermal bypass |
+| **hold volume-up for 2 s** | show the state and the real skin temperature |
+
+A short press still changes the volume as usual — the key events are only
+*read* by the module, never consumed. You get a notification either way.
+
+This works without a reboot because the patched
+`OplusHoraeThermalHelper` reads the switch on **every call**:
+
+```
+persist.oplus.camera.thermal_bypass      1 = on (default), 0 = off
+```
+
+The property is `persist.*`, so your choice survives a reboot.
+
+> Why not just re-mount the jar? Because `oplus-framework.jar` is a
+> **bootclasspath** jar: the zygote opens it once at boot and keeps it
+> mapped, so `umount` fails with *"Device or resource busy"* and the mount
+> can only be created at boot time. A property check inside the class is the
+> only way to switch it live.
 
 ### Verify
 
@@ -89,9 +118,10 @@ pass `--force`; `--no-reboot` skips the reboot.
 # the patched jar must be visible in the ZYGOTE's mount namespace - that is
 # the namespace every app is forked from
 adb shell su -c 'nsenter -t $(pidof zygote64) -m -- md5sum /product/framework/com.oplus.camera.unit.sdk.jar'
-adb shell su -c 'md5sum /data/adb/modules/ocam_sdkfix/SDK-PATCHED.jar'
+adb shell su -c 'md5sum /data/adb/modules/ocam_camfix/SDK-PATCHED.jar'
 
 adb logcat | grep -c "not allow take picture"   # must be 0
+adb shell getprop persist.oplus.camera.thermal_bypass
 adb shell ls -lt /sdcard/DCIM/Camera/ | head -3
 ```
 
@@ -100,7 +130,7 @@ If the two hashes match and a photo appears, the fix is live.
 ### Rollback
 
 ```bash
-./uninstall.sh          # removes the module; the stock SDK is restored untouched
+./uninstall.sh          # removes the module; both stock jars are restored untouched
 ```
 
 > The original file on disk is **never modified** — the patch is a bind mount.
@@ -344,18 +374,14 @@ bash tools/test_boot_guards.sh ksu-module/service.sh
 ```
 README.md                    this file
 LICENSE                      MIT
-install.sh                   patch + install + reboot      (device side)
-install_thermalfix.sh        optional: camera thermal bypass (device side)
-uninstall.sh                 rollback  (--thermal also removes the bypass)
+install.sh                   patch both jars + install + reboot  (device side)
+uninstall.sh                 rollback
 ksu-module/
   module.prop                KernelSU module metadata
-  post-fs-data.sh            boot-time bind mount (init + zygote namespace)
-  service.sh                 late-start fallback + camera-spin watchdog
+  post-fs-data.sh            boot-time bind mounts (init + zygote namespace)
+  service.sh                 zygote-namespace watcher + volume-key switch
+                             + camera-spin watchdog
   sepolicy.rule              lets the camera write its private log to /data/vendor
-ksu-module-thermal/
-  module.prop                KernelSU module metadata (optional module)
-  post-fs-data.sh            boot-time bind mount of the framework jar
-  service.sh                 late-start fallback
 tools/
   patch_sdk.py               applies the three fixes to a decoded smali tree
   dexfp.py                   dex reader: inventory / fingerprint / compare
