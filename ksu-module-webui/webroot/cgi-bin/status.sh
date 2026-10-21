@@ -39,6 +39,20 @@ for f in $(ls -t /data/system/dropbox/ 2>/dev/null | head -60); do
   grep -qm1 "^Process: com.oplus.camera" "/data/system/dropbox/$f" 2>/dev/null && CAM_CRASHES=$((CAM_CRASHES+1))
 done
 
+# ---- camera app's OWN mount namespace (the one that really matters) ------
+# The camera app unshares a mount namespace in which /product/framework is an
+# overlay.  A boot-time bind mount in the init namespace is NOT visible there,
+# so the app can keep loading the stock SDK jar -> ClassCastException -> no
+# photo.  This is the check that shows it.
+CAM_NS_MOUNT=false
+CAM_NS_SHA=""
+CAM_NS_OK=false
+if [ -n "$CAM_PID" ]; then
+  if grep -qx "$SDK_TGT" /proc/$CAM_PID/mountinfo 2>/dev/null; then CAM_NS_MOUNT=true; fi
+  CAM_NS_SHA=$(nsenter -t "$CAM_PID" -m -- sha256sum "$SDK_TGT" 2>/dev/null | cut -d' ' -f1)
+  [ "$CAM_NS_SHA" = "$SDK_ACTUAL" ] && CAM_NS_OK=true
+fi
+
 # ---- thermal -------------------------------------------------------------
 HORA_T=$(dumpsys horae 2>/dev/null | grep -m1 '^Temp:' | sed 's/[^0-9.]//g')
 SKIN_T=$(dumpsys thermalservice 2>/dev/null | grep -m1 mName=SKIN | grep -oE 'mValue=[0-9.]+' | cut -d= -f2)
@@ -74,7 +88,10 @@ cat <<JSON
     "version": "$(esc "$CAM_VER")",
     "pid": "$(esc "$CAM_PID")",
     "running": $( [ -n "$CAM_PID" ] && echo true || echo false ),
-    "crashes": $CAM_CRASHES
+    "crashes": $CAM_CRASHES,
+    "ns_mount": $CAM_NS_MOUNT,
+    "ns_sha": "$(esc "$CAM_NS_SHA")",
+    "ns_ok": $CAM_NS_OK
   },
   "device": {
     "hora_temp": "$(esc "$HORA_T")",

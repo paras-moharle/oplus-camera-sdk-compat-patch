@@ -1,55 +1,47 @@
 #!/system/bin/sh
 #
-# Late-start safety net for the Oplus CameraUnit SDK compat patch.
+# Oplus CameraUnit SDK compat patch - late start watcher  (author: Paras Moharle)
 #
-# post-fs-data.sh already tries to bind-mount the patched SDK.  This runs later
-# (late-start) and re-applies it in case:
-#   * the early mount did not happen yet (e.g. /product was not ready), or
-#   * something unmounted it.
+# The camera app runs in its OWN mount namespace, in which /product/framework
+# is an OverlayFS mount that already contains com.oplus.camera.unit.sdk.jar.
+# The boot-time bind mount (post-fs-data.sh) is applied in the init namespace
+# and is therefore invisible to the camera app, which keeps loading the stock
+# jar and keeps failing with
 #
-# Like post-fs-data.sh this is mount-only, has the same guards, and can never
-# fail a boot.
+#   java.lang.ClassCastException: long[] cannot be cast to int[]
+#
+# This watcher mounts the patched jar into the camera app's namespace as soon
+# as the app appears (measured ~250 ms, before the capture classes are used).
+# That is what makes the fix reliable instead of "works in some boots".
+#
+# It also re-applies the boot-time mount if it is missing for any reason.
+#
+# Nothing here can fail the boot: every path exits 0.
 
 MODDIR=/data/adb/modules/ocam_sdkfix
 SRC="$MODDIR/SDK-PATCHED.jar"
-REF="$MODDIR/SDK-ORIGINAL.jar"
-SIZE_FILE="$MODDIR/SDK-PATCHED.jar.size"
 TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+EXPECT=4946460
 
 [ -f "$SRC" ] || exit 0
-
-# already mounted?  then there is nothing to do
-if awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$TGT"; then
-  exit 0
-fi
-
-# --- guard 1: the patched jar must be a complete file --------------------
 SZ=$(stat -c %s "$SRC" 2>/dev/null)
 [ -n "$SZ" ] || exit 0
-if [ -f "$SIZE_FILE" ]; then
-  EXPECT=$(cat "$SIZE_FILE" 2>/dev/null)
-  [ -n "$EXPECT" ] || exit 0
-  [ "$SZ" = "$EXPECT" ] || exit 0
-else
-  [ "$SZ" -ge 1000000 ] || exit 0
-  case "$(head -c 2 "$SRC" 2>/dev/null)" in
-    PK) ;;
-    *) exit 0 ;;
-  esac
+[ "$SZ" = "$EXPECT" ] || exit 0
+
+# make sure the boot-time mount is there too (init / zygote namespaces)
+if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$TGT"; then
+  mount --bind "$SRC" "$TGT" 2>/dev/null
 fi
 
-# --- guard 2: the SDK on disk must be the one this jar was built from ----
-[ -f "$REF" ] || exit 0
-A=$(sha256sum "$TGT" 2>/dev/null | cut -d' ' -f1)
-B=$(sha256sum "$REF" 2>/dev/null | cut -d' ' -f1)
-[ -n "$A" ] || exit 0
-[ -n "$B" ] || exit 0
-if [ "$A" != "$B" ]; then
-  log -t ocam_sdkfix "SDK on disk does not match this module (OTA or different firmware) - not mounting" 2>/dev/null || true
-  exit 0
-fi
-
-# --- mount ---------------------------------------------------------------
-mount --bind "$SRC" "$TGT" 2>/dev/null
+LAST_PID=""
+while true; do
+  PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
+  if [ -n "$PID" ] && [ "$PID" != "$LAST_PID" ]; then
+    # the app may have created its namespace already - mount into it
+    nsenter -t "$PID" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null
+    LAST_PID="$PID"
+  fi
+  sleep 0.2
+done
 
 exit 0

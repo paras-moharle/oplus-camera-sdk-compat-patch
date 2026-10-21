@@ -64,8 +64,10 @@
     <div class="row"><span>version</span><span id="camVer">–</span></div>
     <div class="row"><span>process</span><span id="camPid">–</span></div>
     <div class="row"><span>crashes recorded</span><span id="camCrash">–</span></div>
+    <div class="row"><span>app sees patched SDK</span><span id="camNs">–</span></div>
     <div class="btns">
-      <button class="p" onclick="act('remount')">Re-mount both</button>
+      <button class="p" onclick="act('repair')">Repair mounts</button>
+      <button onclick="act('remount')">Re-mount both</button>
       <button onclick="act('stop')">Force stop camera</button>
       <button onclick="act('start')">Restart camera</button>
       <button onclick="act('shutter')">Test capture</button>
@@ -139,6 +141,7 @@ async function refresh(){
     $('camPid').className = s.camera.running ? 'ok' : 'dim';
     $('camCrash').textContent = s.camera.crashes;
     $('camCrash').className = s.camera.crashes ? 'warn' : 'ok';
+    mark($('camNs'), s.camera.ns_ok);
     $('camBadge').className = 'badge ' + (s.camera.running?'b-ok':'b-warn');
     $('camBadge').textContent = s.camera.running?'RUNNING':'STOPPED';
 

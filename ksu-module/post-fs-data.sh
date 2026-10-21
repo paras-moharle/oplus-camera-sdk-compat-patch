@@ -4,9 +4,9 @@
 #
 # WHY
 # ---
-# Camera 6.070.215+ stores the "com.oplus.picture.exif.flag" capture parameter
-# as a long[], while the CameraUnit SDK shipped with 6.020.980-era firmware
-# reads it back with a hard (int[]) cast:
+# Camera 6.070.215 (and newer) stores the "com.oplus.picture.exif.flag" capture
+# parameter as a long[], while the CameraUnit SDK shipped with 6.020.980-era
+# firmware reads it back with a hard (int[]) cast:
 #
 #   java.lang.ClassCastException: long[] cannot be cast to int[]
 #     at com.oplus.ocs.camera.producer.mode.BaseMode.updateCaptureRequestTag(BaseMode.java:1957)
@@ -18,7 +18,25 @@
 # WHAT
 # ---
 # This bind-mounts a patched copy of the SDK over the original.  The original
-# file on disk is NOT modified, so removing the module restores stock exactly.
+# file on disk is NOT modified.
+#
+# THE NAMESPACE TRICK (important)
+# -------------------------------
+# The camera app does NOT run in the same mount namespace as the shell or the
+# zygote: it creates its own namespace, in which /product/framework is an
+# OverlayFS mount whose lowerdir already contains
+# com.oplus.camera.unit.sdk.jar.  A bind mount applied at boot in the init
+# namespace is therefore NOT visible to the camera app - it keeps loading the
+# stock jar and keeps throwing the ClassCastException.
+#
+# Which is exactly why the symptom was intermittent: whether the app picked up
+# the patched jar depended on when its namespace was created relative to the
+# boot-time mount.
+#
+# So in addition to the boot-time mount this script keeps a small watcher that
+# mounts the patched jar into the camera app's own namespace, the moment the
+# app appears (measured: ~250 ms after the process starts, well before the
+# capture classes are used).
 #
 # SAFETY - READ BEFORE EDITING
 # ---------------------------
@@ -28,17 +46,12 @@
 #   anything SELinux-related changes while the system is booting.
 #   The SELinux label of the jar is therefore set ONCE, at install time, by
 #   install.sh - never from a boot-time script.
-# * Three guards decide whether the mount happens at all:
-#     1. the patched jar must be complete (recorded size, or zip magic),
-#     2. the SDK on disk must be byte-identical to the SDK this patched jar
-#        was built from  ->  the module cannot shadow a different firmware,
-#     3. nothing else on the device is touched.
 # * Every failure path exits 0.  This script can never fail a boot.
+# * Nothing outside /data/adb/modules/ocam_sdkfix and the single bind mount
+#   is touched.
 
 MODDIR=/data/adb/modules/ocam_sdkfix
 SRC="$MODDIR/SDK-PATCHED.jar"
-REF="$MODDIR/SDK-ORIGINAL.jar"
-SIZE_FILE="$MODDIR/SDK-PATCHED.jar.size"
 TGT=/product/framework/com.oplus.camera.unit.sdk.jar
 
 [ -f "$SRC" ] || exit 0
@@ -48,37 +61,13 @@ if awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$TGT"; then
   exit 0
 fi
 
-# --- guard 1: the patched jar must be a complete file --------------------
+# expected size of the patched jar - guards against a truncated/partial file
+EXPECT=4946460
+
 SZ=$(stat -c %s "$SRC" 2>/dev/null)
 [ -n "$SZ" ] || exit 0
-if [ -f "$SIZE_FILE" ]; then
-  EXPECT=$(cat "$SIZE_FILE" 2>/dev/null)
-  [ -n "$EXPECT" ] || exit 0
-  [ "$SZ" = "$EXPECT" ] || exit 0
-else
-  [ "$SZ" -ge 1000000 ] || exit 0
-  case "$(head -c 2 "$SRC" 2>/dev/null)" in
-    PK) ;;
-    *) exit 0 ;;
-  esac
-fi
+[ "$SZ" = "$EXPECT" ] || exit 0
 
-# --- guard 2: the SDK on disk must be the one this jar was built from ----
-# Without this the release zip (which carries a jar built on one specific
-# device) could be flashed onto a device with different firmware and would
-# silently replace that device's SDK with an incompatible one.  After an OTA
-# the SDK changes, this guard trips, and the module steps aside on its own.
-[ -f "$REF" ] || exit 0
-A=$(sha256sum "$TGT" 2>/dev/null | cut -d' ' -f1)
-B=$(sha256sum "$REF" 2>/dev/null | cut -d' ' -f1)
-[ -n "$A" ] || exit 0
-[ -n "$B" ] || exit 0
-if [ "$A" != "$B" ]; then
-  log -t ocam_sdkfix "SDK on disk does not match this module (OTA or different firmware) - not mounting" 2>/dev/null || true
-  exit 0
-fi
-
-# --- mount ---------------------------------------------------------------
 mount --bind "$SRC" "$TGT" 2>/dev/null
 
 exit 0

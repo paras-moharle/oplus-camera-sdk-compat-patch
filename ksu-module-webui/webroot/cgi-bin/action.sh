@@ -2,11 +2,13 @@
 #
 # action.sh - CGI endpoint: performs a quick action.
 #
-#   ?a=remount      re-apply both bind mounts (runs the modules' own scripts)
-#   ?a=stop         force stop the camera
-#   ?a=start        force stop + relaunch the camera
-#   ?a=shutter      fire a shutter press
-#   ?a=restart_http restart the dashboard itself
+#   ?a=remount   re-apply both bind mounts (runs the modules' own scripts)
+#   ?a=repair    remount + mount the patched SDK into the camera app's own
+#                mount namespace (the camera runs in its own namespace and
+#                otherwise keeps loading the stock jar)
+#   ?a=stop      force stop the camera
+#   ?a=start     force stop + relaunch the camera
+#   ?a=shutter   fire a shutter press
 #
 echo "Content-Type: application/json"
 echo "Cache-Control: no-store"
@@ -15,14 +17,27 @@ echo ""
 ACT=$(printf '%s' "${QUERY_STRING:-}" | sed 's/.*a=\([a-z_]*\).*/\1/')
 SDK_DIR=/data/adb/modules/ocam_sdkfix
 TH_DIR=/data/adb/modules/ocam_thermalfix
+SRC="$SDK_DIR/SDK-PATCHED.jar"
+TGT=/product/framework/com.oplus.camera.unit.sdk.jar
 MSG=""
 
 case "$ACT" in
   remount)
-    # run each module's own boot script - it has the guards (hash, size, label)
     sh "$SDK_DIR/post-fs-data.sh" >/dev/null 2>&1
     sh "$TH_DIR/post-fs-data.sh" >/dev/null 2>&1
     MSG="re-applied both bind mounts"
+    ;;
+  repair)
+    sh "$SDK_DIR/post-fs-data.sh" >/dev/null 2>&1
+    sh "$TH_DIR/post-fs-data.sh" >/dev/null 2>&1
+    PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
+    if [ -n "$PID" ]; then
+      nsenter -t "$PID" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null \
+        && MSG="repaired: patched SDK mounted into the camera namespace" \
+        || MSG="repair: could not enter the camera namespace"
+    else
+      MSG="repair: camera is not running (start it first)"
+    fi
     ;;
   stop)
     am force-stop com.oplus.camera >/dev/null 2>&1
@@ -35,7 +50,7 @@ case "$ACT" in
     MSG="camera restarted"
     ;;
   shutter)
-    input tap 619 2253 >/dev/null 2>&1
+    input tap 613 2273 >/dev/null 2>&1
     MSG="shutter fired"
     ;;
   *)
