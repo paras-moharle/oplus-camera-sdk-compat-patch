@@ -221,6 +221,7 @@ KEYPID=$!
 
 LAST_Z=""
 LAST_PID=""
+WATCH_N=0
 
 while true; do
   # --- the zygote: the important one -------------------------------------
@@ -230,9 +231,21 @@ while true; do
     break
   done
 
-  if [ -n "$Z" ] && [ "$Z" != "$LAST_Z" ]; then
-    LAST_Z="$Z"
-    nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+  # The mount is checked, not just tracked by PID: the zygote namespace can
+  # lose the mount (a late `umount`, a remount of /product, ...) and the
+  # camera would silently fall back to the stock jar.
+  if [ -n "$Z" ]; then
+    if [ "$Z" != "$LAST_Z" ]; then
+      LAST_Z="$Z"
+      nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+    elif [ $((WATCH_N % 20)) -eq 0 ]; then
+      if ! nsenter -t "$Z" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
+           | grep -qx "$SDK_TGT"; then
+        say "the zygote namespace lost the patched jar - restoring it"
+        nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+      fi
+    fi
+    WATCH_N=$((WATCH_N + 1))
   fi
 
   # --- init namespace (in case it was lost) ------------------------------
