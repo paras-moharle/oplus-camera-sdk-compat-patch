@@ -87,9 +87,28 @@ if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$SDK_TGT"; th
   mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
 fi
 
-# 2) the zygote namespace - this is the one that matters.  The zygote forks
-#    every app, so a mount that is visible to the zygote is inherited by all
-#    apps started afterwards, and ART then extracts the PATCHED classes.dex.
+# 2) the zygote namespace - this is the one that matters.
+#
+# ART opens the jar itself (it is not a bootclasspath jar) and, when it opens
+# the STOCK jar, it matches the OEM's prebuilt artifact
+#
+#     /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
+#
+# which was compiled from the stock code - so the camera silently runs the
+# unpatched SDK and every capture is cancelled.  The mount has to be in place
+# BEFORE the app process starts, which means before the zygote forks it.
+#
+# The prebuilt artifact is invalidated as well (an empty file over it), so
+# ART can never fall back to the stock compiled code: it re-dexopts the jar
+# that is actually mounted, i.e. ours.
+OAT_TGT=/product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
+if [ -e "$OAT_TGT" ]; then
+  if ! awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -qx "$OAT_TGT"; then
+    : > "$MODDIR/empty.vdex" 2>/dev/null
+    [ -f "$MODDIR/empty.vdex" ] && mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+  fi
+fi
+
 Z=""
 for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
   Z="$p"
@@ -97,6 +116,9 @@ for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
 done
 if [ -n "$Z" ]; then
   nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+  if [ -e "$OAT_TGT" ]; then
+    nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+  fi
 fi
 
 # ----------------------------------------------------------- framework jar

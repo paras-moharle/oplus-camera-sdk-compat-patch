@@ -39,6 +39,8 @@
 MODDIR=/data/adb/modules/ocam_camfix
 SDK_SRC="$MODDIR/SDK-PATCHED.jar"
 SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+OAT_TGT=/product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
+DEX_CACHE=/data/dalvik-cache/arm64/product@framework@com.oplus.camera.unit.sdk.jar
 PROP=persist.oplus.camera.thermal_bypass
 
 [ -f "$SDK_SRC" ] || exit 0
@@ -48,7 +50,21 @@ if [ "$(getprop $PROP)" = "" ]; then
   setprop $PROP 1
 fi
 
+# An empty file used to invalidate the OEM's prebuilt artifact for the SDK
+# jar, so that ART can never fall back to the stock compiled code.
+[ -f "$MODDIR/empty.vdex" ] || : > "$MODDIR/empty.vdex" 2>/dev/null
+
 # ------------------------------------------------------------------ helpers
+
+# ART keeps the dexopt output of the SDK jar in /data/dalvik-cache.  If that
+# cache was built from the STOCK jar, ART keeps using it (and the camera
+# keeps cancelling every capture), so it has to be dropped whenever the mount
+# is (re)applied.  The next app that starts then dexopts the jar that is
+# really mounted - ours.
+clear_dex_cache() {
+  rm -f "$DEX_CACHE"@classes.vdex 2>/dev/null
+  rm -f "$DEX_CACHE"@classes.dex 2>/dev/null
+}
 
 now_ms() {
   # /proc/uptime has centisecond resolution - plenty for a 2 s threshold
@@ -233,16 +249,25 @@ while true; do
 
   # The mount is checked, not just tracked by PID: the zygote namespace can
   # lose the mount (a late `umount`, a remount of /product, ...) and the
-  # camera would silently fall back to the stock jar.
+  # camera would silently fall back to the stock jar - and to the OEM's
+  # prebuilt artifact compiled from it.
   if [ -n "$Z" ]; then
     if [ "$Z" != "$LAST_Z" ]; then
       LAST_Z="$Z"
       nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
-    elif [ $((WATCH_N % 20)) -eq 0 ]; then
+      [ -e "$OAT_TGT" ] && nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+      clear_dex_cache
+    elif [ $((WATCH_N % 4)) -eq 0 ]; then
       if ! nsenter -t "$Z" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
            | grep -qx "$SDK_TGT"; then
         say "the zygote namespace lost the patched jar - restoring it"
         nsenter -t "$Z" -m -- mount --bind "$SDK_SRC" "$SDK_TGT" 2>/dev/null
+        [ -e "$OAT_TGT" ] && nsenter -t "$Z" -m -- mount --bind "$MODDIR/empty.vdex" "$OAT_TGT" 2>/dev/null
+        # ART caches the dexopt output in /data/dalvik-cache.  If that cache
+        # was built from the stock jar it would keep being used, so it has to
+        # go - the next app that starts then dexopts the jar that is really
+        # mounted (ours).
+        clear_dex_cache
       fi
     fi
     WATCH_N=$((WATCH_N + 1))
