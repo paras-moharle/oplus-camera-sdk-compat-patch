@@ -1,6 +1,6 @@
 #!/system/bin/sh
 #
-# Oplus camera fix - CameraUnit SDK + thermal bypass  (author: Paras Moharle)
+# Oplus camera fix - post-fs-data  (author: Paras Moharle)
 #
 # WHAT THIS MODULE DOES
 # ---------------------
@@ -26,53 +26,79 @@
 #
 #         persist.oplus.camera.thermal_bypass   (1 = on, 0 = off)
 #
-# THE MOUNT NAMESPACE (the part that is easy to get wrong)
-# ------------------------------------------------------
-# The camera app does not run in the mount namespace of init:
+# WHY THE SDK JAR IS NOT MOUNTED ANY MORE  (read this before editing!)
+# -------------------------------------------------------------------
+# A bind mount over /product/framework/... does NOT reach the camera app:
 #
-#   * the zygote unshares its own mount namespace and makes the root mount a
-#     slave, so every mount that init performs AFTER the zygote has started is
-#     invisible to the zygote and to every app forked from it
-#   * ART extracts classes.dex from the jar when the app process starts, so
-#     mounting the patched jar into the app's namespace afterwards is USELESS
-#     - the app has already loaded the stock classes
+#   * every app process gets a FRESH mount namespace, and everything this
+#     module mounted is removed from it (KernelSU's kmount feature and the
+#     Zygisk denamespace both do that).  The app then sees the OEM OverlayFS
+#     again - the overlay whose lowerdir is a read-only erofs image.
+#   * OverlayFS pins the lowerdir dentry when the overlay is created, so a
+#     mount over the merged path or over the lowerdir path is never seen by
+#     an open() that goes through the overlay.
 #
-# So the patched SDK jar has to be mounted into the ZYGOTE's mount namespace
-# before the camera app is forked from it.  That is what this script does
-# (and what service.sh retries if the zygote was not up yet).
+# The only mechanism that survives all of that is a VFS path redirect in the
+# kernel.  This device already runs the NoMount metamodule ("nm"), which
+# implements exactly that, and it re-injects the redirects of every module at
+# boot from the module's partition tree:
+#
+#     <module>/product/framework/com.oplus.camera.unit.sdk.jar
+#         -> /product/framework/com.oplus.camera.unit.sdk.jar
+#     <module>/product/framework/oat/arm64/com.oplus.camera.unit.sdk.{odex,vdex}
+#         -> the same paths (the files are empty, so ART must extract the dex
+#            from the patched jar instead of using the OEM's stock artifacts)
+#
+# That redirect is namespace independent, so the camera ALWAYS loads the
+# patched SDK, no matter what the mount namespace looks like.
 #
 # oplus-framework.jar is a BOOTCLASSPATH jar: the zygote opens it once at
-# boot and keeps it mapped, so the mount over it can only be created at boot
-# time (unmounting it later fails with "Device or resource busy").  That is
-# why the thermal bypass is switched through a system property that the
-# patched class reads on every call, instead of by re-mounting the jar.
+# boot and keeps it mapped, so the thermal patch is still delivered as a bind
+# mount, created here - before the zygote starts.  Unmounting it later fails
+# with "Device or resource busy", which is why the bypass itself is switched
+# through a system property that the patched class reads on every call.
 #
 # SAFETY - READ BEFORE EDITING
 # ---------------------------
-# * This script performs a "mount --bind" and NOTHING else.  It must never run
-#   chcon / setfattr / setenforce: MediaTek's MKP kernel-integrity module hashes
-#   the SELinux state and panics the kernel (-> kernel panic, boot loop) when
-#   anything SELinux-related changes while the system is booting.
-#   The SELinux label of the jar is therefore set ONCE, at install time, by
-#   install.sh - never from a boot-time script.
+# * No chcon / setfattr / setenforce here: MediaTek's MKP kernel-integrity
+#   module hashes the SELinux state and panics the kernel (-> boot loop) when
+#   anything SELinux-related changes while the system is booting.  Labels are
+#   set ONCE, at install time, by install.sh.
+# * One bind mount only, through bind_once(), which never stacks mounts.
 # * Every failure path exits 0.  This script can never fail a boot.
-# * Nothing outside /data/adb/modules/ocam_camfix and the two bind mounts is
+# * Nothing outside /data/adb/modules/ocam_camfix and that one bind mount is
 #   touched.
+
+PATH=/system/bin:/system/xbin:/vendor/bin:/bin:/sbin:$PATH
+export PATH
 
 MODDIR=/data/adb/modules/ocam_camfix
 
+# the patched jar, kept twice on purpose:
+#   SDK-PATCHED.jar                  - the source of truth / what install.sh
+#                                      and the tools check
+#   product/framework/...sdk.jar     - the file NoMount redirects the OEM path
+#                                      to, injected by NoMount's metamount.sh
 SDK_SRC="$MODDIR/SDK-PATCHED.jar"
+SDK_REDIR="$MODDIR/product/framework/com.oplus.camera.unit.sdk.jar"
+OAT_REDIR="$MODDIR/product/framework/oat/arm64"
+
 SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
+OAT_TGT=/product/framework/oat/arm64
 OFW_SRC="$MODDIR/PATCHED-ofw.jar"
 OFW_TGT=/system/framework/oplus-framework.jar
 
+PROP=persist.oplus.camera.thermal_bypass
+LOG="$MODDIR/status.txt"
+
+say() { log -t ocam_camfix "$*"; echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
+
 [ -f "$SDK_SRC" ] || exit 0
-[ -f "$OFW_SRC" ] || exit 0
 
 # The run-time switch for the thermal bypass.  A persist.* property survives
 # a reboot, so the user's choice is kept.
-if [ "$(getprop persist.oplus.camera.thermal_bypass)" = "" ]; then
-  setprop persist.oplus.camera.thermal_bypass 1
+if [ "$(getprop $PROP)" = "" ]; then
+  setprop $PROP 1
 fi
 
 # ---------------------------------------------------------------- SDK jar
@@ -82,143 +108,89 @@ SDK_SZ=$(stat -c %s "$SDK_SRC" 2>/dev/null)
 [ -n "$SDK_SZ" ] || exit 0
 [ "$SDK_SZ" = "$SDK_EXPECT" ] || exit 0
 
-# bind_once <source> <target> [namespace]
-#
-# NEVER stack a mount: a mount on an already-mounted path creates another
-# mount on top of it, and doing that in a loop fills the mount table until
-# the kernel gives up (this crashed the phone once).  The target is always
-# checked first, in the namespace the mount is going to be created in.
-MOUNTS_MADE=0
-MOUNT_CAP=16
+# The redirect target tree ships in the module zip.  It is re-synced from
+# SDK-PATCHED.jar only when the size differs, so that an upgrade can never
+# leave an old jar behind.  cp over an EXISTING file keeps its SELinux label
+# (system_file, set by install.sh) - never delete and recreate it here.
+mkdir -p "$OAT_REDIR" 2>/dev/null
+if [ ! -f "$SDK_REDIR" ]; then
+  cp -f "$SDK_SRC" "$SDK_REDIR" 2>/dev/null
+else
+  REDIR_SZ=$(stat -c %s "$SDK_REDIR" 2>/dev/null)
+  [ "$REDIR_SZ" = "$SDK_SZ" ] || cp -f "$SDK_SRC" "$SDK_REDIR" 2>/dev/null
+fi
+for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+  [ -f "$OAT_REDIR/$f" ] || : > "$OAT_REDIR/$f" 2>/dev/null
+done
 
-# Is $SRC already mounted at $TGT (in the namespace $NS, or the current one)?
+# ------------------------------------------------------------------- rules
 #
-# The check has to compare the INODE, not just the path: /product/framework is
-# already a mount (the OEM's OverlayFS), so a path-only check would wrongly
-# conclude "already done" and never mount our replacement directory.
-# Comparing the device+inode of the source with the device+inode that the
-# target resolves to tells us whether *our* file is already there.
-already_ours() {
-  SRC="$1"; TGT="$2"; NS="$3"
-  if [ -n "$NS" ]; then
-    A=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$SRC" 2>/dev/null)
-    B=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$TGT" 2>/dev/null)
-  else
-    A=$(stat -Lc "%d:%i" "$SRC" 2>/dev/null)
-    B=$(stat -Lc "%d:%i" "$TGT" 2>/dev/null)
-  fi
-  [ -n "$A" ] && [ -n "$B" ] && [ "$A" = "$B" ]
+# NoMount's metamount.sh has normally injected these already (it runs before
+# this script).  Adding them here again is cheap and idempotent - "nm rule
+# add" REPLACES an existing rule with the same virtual path - and it covers
+# the case where the metamodule was updated/reloaded in between.
+#
+# The parent directory has to be resolved in a namespace where
+# /product/framework is the OEM overlay (it is, here: this module mounts
+# nothing over /product/framework any more).
+NM=""
+for c in "$MODDIR/../nomount/bin/nm" /data/adb/ksu/bin/nm /data/adb/ap/bin/nm nm; do
+  if command -v "$c" >/dev/null 2>&1; then NM="$c"; break; fi
+done
+
+add_rules() {
+  [ -n "$NM" ] || return 1
+  "$NM" rule add "$SDK_TGT" "$SDK_REDIR" >/dev/null 2>&1 || return 1
+  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+    "$NM" rule add "$OAT_TGT/$f" "$OAT_REDIR/$f" >/dev/null 2>&1 || return 1
+  done
+  return 0
 }
 
-bind_once() {
-  SRC="$1"; TGT="$2"; NS="$3"
-  [ -e "$TGT" ] || return 0
-  already_ours "$SRC" "$TGT" "$NS" && return 0
-
-  # Hard cap.  The module may create a handful of mounts, never more.  If the
-  # counter goes over the cap something is looping, and the module takes
-  # itself out of the game instead of filling the mount table.
-  if [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ]; then
-    return 0
-  fi
-
-  if [ -n "$NS" ]; then
-    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
-  else
-    mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
-  fi
+# When is the redirect in effect?  When a plain stat of the OEM path reports
+# OUR jar and an empty vdex.  That is the same test service.sh uses.
+redirect_ok() {
+  SZ=$(stat -Lc %s "$SDK_TGT" 2>/dev/null)
+  VZ=$(stat -Lc %s "$OAT_TGT/com.oplus.camera.unit.sdk.vdex" 2>/dev/null)
+  [ "$SZ" = "$SDK_SZ" ] && [ "$VZ" = "0" ]
 }
 
-# 1) the init namespace
-bind_once "$SDK_SRC" "$SDK_TGT" ""
+# NoMount may still be loading (it is a metamodule, but be defensive).  A few
+# one-second retries are enough; boot is never held up for long.
+i=0
+while [ "$i" -lt 5 ]; do
+  add_rules && break
+  i=$((i + 1))
+  sleep 1
+done
+
+if [ -z "$NM" ]; then
+  say "WARNING: NoMount (nm) not found - the SDK redirect cannot be applied"
+elif redirect_ok; then
+  say "SDK redirect active: $(stat -Lc %s "$SDK_TGT") bytes"
+else
+  say "WARNING: SDK redirect not effective after post-fs-data"
+fi
 
 # ART keeps the dexopt output of the jar in /data/dalvik-cache.  If that
 # cache was built from the STOCK jar it would keep being used and the camera
 # would silently run the unpatched SDK.  It is dropped here, before the
-# zygote starts, so that ART always builds it from the jar that is mounted
+# zygote starts, so that ART always builds it from the jar that is redirected
 # now - ours.
 DEX_CACHE=/data/dalvik-cache/arm64/product@framework@com.oplus.camera.unit.sdk.jar
 rm -f "$DEX_CACHE"@classes.vdex 2>/dev/null
 rm -f "$DEX_CACHE"@classes.dex 2>/dev/null
 
-# 2) the zygote namespace - this is the one that matters.
-#
-# ART opens the jar itself (it is not a bootclasspath jar) and, when it opens
-# the STOCK jar, it matches the OEM's prebuilt artifact
-#
-#     /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
-#
-# which was compiled from the stock code - so the camera silently runs the
-# unpatched SDK and every capture is cancelled.  The mount has to be in place
-# BEFORE the app process starts, which means before the zygote forks it.
-#
-# ---------------------------------------------------------------------------
-# The replacement directory for /product/framework
-#
-# /product/framework is an OverlayFS on a read-only erofs partition, and ART
-# opens the CameraUnit SDK jar *through* that overlay.  Two things then defeat
-# any bind mount:
-#
-#   1. the OEM ships prebuilt dexopt artifacts for the jar
-#      (oat/arm64/com.oplus.camera.unit.sdk.odex / .vdex) that were compiled
-#      from the STOCK code - ART uses them and never reads the jar
-#   2. the overlay pins the dentry: a mount over the merged path (or over the
-#      lowerdir path) is visible to a plain path lookup, but ART's open goes
-#      through the overlay's own file handle and lands on the original inode
-#
-# So the overlay is replaced by a plain directory that contains the patched
-# jar and no prebuilt artifacts.  ART then extracts the dex from the jar that
-# is really there.
-PF="$MODDIR/pf"
-PF_JAR="$PF/com.oplus.camera.unit.sdk.jar"
-
-if [ ! -f "$PF_JAR" ]; then
-  rm -rf "$PF" 2>/dev/null
-  mkdir -p "$PF" 2>/dev/null
-  cp -a /product/framework/. "$PF/" 2>/dev/null
+# Legacy leftovers of module versions <= 2.4 (they mounted a replacement
+# directory over /product/framework).  The redirect above supersedes them;
+# removing the 12 MB copy keeps upgrades clean.  The dir is removed only when
+# it is not a live mount source (it still is, in the boot that upgrades from
+# v2.x - deleting it then would pull the files out from under the mount).
+if [ -d "$MODDIR/pf" ] && ! grep -q "$MODDIR/pf" /proc/self/mountinfo 2>/dev/null; then
+  rm -rf "$MODDIR/pf" 2>/dev/null
 fi
-
-# the patched jar has to be the one in the replacement directory
-cp -f "$SDK_SRC" "$PF_JAR" 2>/dev/null
-
-# and the OEM's prebuilt artifacts must not be in it
-for f in "$PF/oat/arm64/com.oplus.camera.unit.sdk.vdex" "$PF/oat/arm64/com.oplus.camera.unit.sdk.odex"; do
-  [ -e "$f" ] && : > "$f" 2>/dev/null
-done
-
-bind_once "$PF" /product/framework ""
-
-# The prebuilt artifacts are invalidated as well, so ART can never fall back
-# to the stock compiled code.
-#
-# The OEM ships a prebuilt dexopt artifact for the CameraUnit SDK jar:
-#
-#     /product/framework/oat/arm64/com.oplus.camera.unit.sdk.odex
-#     /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex
-#
-# They were compiled from the STOCK jar.  When ART finds them it uses them
-# and never looks at the jar - so even though the patched jar was mounted,
-# the camera ran the STOCK sdk and cancelled every capture with no error
-# anywhere.  Masking both with an empty file forces ART to extract the dex
-# from the jar that is actually mounted (ours).
-OAT_DIR=/product/framework/oat/arm64
-: > "$MODDIR/empty.bin" 2>/dev/null
-for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
-  [ -e "$OAT_DIR/$f" ] || continue
-  bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" ""
-done
-
-Z=""
-for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
-  Z="$p"
-  break
-done
-if [ -n "$Z" ]; then
-  bind_once "$PF" /product/framework "$Z"
-  bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
-  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
-    bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" "$Z"
-  done
+if [ -f "$MODDIR/empty.bin" ] && ! grep -q "$MODDIR/empty.bin" /proc/self/mountinfo 2>/dev/null; then
+  rm -f "$MODDIR/empty.bin" 2>/dev/null
 fi
 
 # ----------------------------------------------------------- framework jar
@@ -228,6 +200,33 @@ OFW_SZ=$(stat -c %s "$OFW_SRC" 2>/dev/null)
 [ -n "$OFW_SZ" ] || exit 0
 [ "$OFW_SZ" = "$OFW_EXPECT" ] || exit 0
 
-bind_once "$OFW_SRC" "$OFW_TGT" ""
+# bind_once <source> <target>
+#
+# NEVER stack a mount: a mount on an already-mounted path creates another
+# mount on top of it, and a loop doing that filled the mount table with 6146
+# entries once and took the phone down.  Compare the device+inode instead of
+# just the path (/system/framework/oplus-framework.jar is not a mount, but
+# /product/framework was, so the inode check is the only safe one).
+MOUNTS_MADE=0
+MOUNT_CAP=4
+
+already_ours() {
+  A=$(stat -Lc "%d:%i" "$1" 2>/dev/null)
+  B=$(stat -Lc "%d:%i" "$2" 2>/dev/null)
+  [ -n "$A" ] && [ -n "$B" ] && [ "$A" = "$B" ]
+}
+
+bind_once() {
+  [ -e "$2" ] || return 0
+  already_ours "$1" "$2" && return 0
+  [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ] && return 0
+  if mount --bind "$1" "$2" 2>/dev/null; then
+    MOUNTS_MADE=$((MOUNTS_MADE + 1))
+    return 0
+  fi
+  return 1
+}
+
+bind_once "$OFW_SRC" "$OFW_TGT" && say "thermal patch mounted over $OFW_TGT"
 
 exit 0

@@ -14,7 +14,7 @@
 | **Symptom** | Shutter does nothing. No photo, no error, no log. Video works. **It affects the stock camera app too.** |
 | **Cause 1 — the AI/APS gate** | The CameraUnit SDK always enters the AI/APS capture path (`BaseMode.isNeedAPSProcess()` is hard-coded `true`). That path needs `libai_perception_scene_detect.so`, `libarcsoft_hdr_denoise_api_v4.so`, `libImplicitWatermark.so`, `libUpScale.so` and the `com.oplus.aps.params.*` config, **none of which exist in this firmware's `/odm/lib64`**. The APS therefore never finishes initialising, and `ProducerImpl.takePicture()` cancels **every** capture with `CF_APS_FINISH_ADD_FRAME`. |
 | **Cause 2 — the exif cast** (6.070.215+ only) | The new APK passes capture param `com.oplus.picture.exif.flag` as **`long[]`**; the device's CameraUnit SDK reads it back as **`(int[])`** → `ClassCastException` inside `takePicture()`. |
-| **Cause 3 — the mount namespace** | The patched jar is only used if it is bind-mounted into the **zygote's** mount namespace *before* the camera app is forked from it. ART extracts `classes.dex` from the jar when the app process starts, so a mount that lands later is silently ignored — the symptom is "it works for a while, then it doesn't". |
+| **Cause 3 — the mount namespace** | The patched jar is only used if every path lookup of `/product/framework/com.oplus.camera.unit.sdk.jar` lands on it. Every app gets a fresh mount namespace in which bind mounts are stripped, and the OEM's OverlayFS pins its lowerdir — so the module delivers the jar through a **kernel VFS path redirect** (NoMount), which is namespace independent. A bind mount works "for a while" and then silently reverts to the stock jar. |
 | **Why silent** | 6.070.215 logs into the "private log" (`/data/vendor/cam_alog_*.txt`), which this firmware's SELinux policy does not allow the camera to write. The writer then retries ~3000×/s, pegs a CPU core and eventually gets the camera process killed. |
 
 The camera's own private log is the proof:
@@ -61,7 +61,7 @@ Details: **[docs/THERMAL-BYPASS.md](docs/THERMAL-BYPASS.md)**.
 
 ## Install (easiest: KernelSU module)
 
-One module does both fixes. Download **`ocam_camfix-v2.0.zip`** from the
+One module does both fixes. Download **`ocam_camfix-v3.0.zip`** from the
 [Releases](https://github.com/paras-moharle/oplus-camera-sdk-compat-patch/releases) page:
 
 1. KernelSU Manager → **Modules** → **Install from storage** → pick the zip → reboot.
@@ -115,10 +115,12 @@ The property is `persist.*`, so your choice survives a reboot.
 ### Verify
 
 ```bash
-# the patched jar must be visible in the ZYGOTE's mount namespace - that is
-# the namespace every app is forked from
-adb shell su -c 'nsenter -t $(pidof zygote64) -m -- md5sum /product/framework/com.oplus.camera.unit.sdk.jar'
-adb shell su -c 'md5sum /data/adb/modules/ocam_camfix/SDK-PATCHED.jar'
+# the OEM path must resolve to the patched jar (size 4946456, not 4926415)
+adb shell su -c 'stat -Lc %s /product/framework/com.oplus.camera.unit.sdk.jar'
+# the OEM prebuilt dexopt artifact must be masked
+adb shell su -c 'stat -Lc %s /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex'
+# the app must map the extracted dex, not the stock file
+adb shell su -c 'grep camera.unit.sdk /proc/$(pidof com.oplus.camera)/maps'
 
 adb logcat | grep -c "not allow take picture"   # must be 0
 adb shell getprop persist.oplus.camera.thermal_bypass
@@ -207,55 +209,73 @@ request.
 
 ---
 
-## The mount-namespace trap (why it "worked for a while, then didn't")
+## Why a bind mount cannot work (and what does)
 
 This is the part that makes this bug look intermittent, and it is worth
 understanding before you change anything in the module.
 
-```
-init                    zygote                  com.oplus.camera
- |  mount --bind          |                         |
- |---------------------->|  (inherited)             |
- |                       |--- fork ---------------->|
- |                       |                         | ART extracts classes.dex
- |                       |                         | from the jar  <-- HERE
-```
-
-* `init` creates `/product/framework` as an **OverlayFS** whose lowerdir is
-  `/mnt/vendor/my_product/product_overlay/framework/`.
-* The **zygote unshares its own mount namespace** and makes the root mount a
-  *slave*. Every mount that `init` performs **after** the zygote has started is
-  therefore invisible to the zygote — and to every app forked from it.
+* **Every app process gets its own, freshly built mount namespace** — and every
+  mount this module made is removed from it (KernelSU's *kmount* feature and
+  the Zygisk *denamespace* step both do that, to hide modules from apps). The
+  app then sees the OEM filesystem again.
+* `/product/framework` is an **OverlayFS** whose lowerdir is a read-only image.
+  OverlayFS **pins the lowerdir dentry when the overlay is created**, so a
+  bind mount over the merged path — or over the lowerdir path — is never seen
+  by an `open()` that goes through the overlay.
 * **ART extracts `classes.dex` from the jar when the app process starts.** A
-  mount that appears later is never seen: the app keeps the stock classes and
-  keeps cancelling captures, with no error anywhere.
+  mount that appears later is never seen either.
 
-That is why a watcher that mounts the patched jar into the *camera app's* own
-namespace is useless — by the time the app exists, its dex is already
-extracted. The mount has to be in the **zygote's** namespace, before the app
-is forked.
+So there is no mount that the camera can see. What *does* survive is a
+**kernel VFS path redirect**: this device runs the **NoMount** metamodule
+(`nm`, v2.1.1), which rewrites path lookups in the kernel. That is namespace
+independent, so every process — in every namespace, including a namespace
+created after the rule — opens the patched jar.
 
-Both are done by the module:
-
-| When | Where | Why |
+| What | Mechanism | Why |
 |---|---|---|
-| `post-fs-data.sh` (≈ t=10 s) | init namespace **and** zygote namespace | wins the race against the zygote (≈ t=12–13 s) in the normal case |
-| `service.sh` (watcher) | zygote namespace | closes the race when the zygote started first (this phone runs an MKP kernel-panic storm, load average 20+, and the zygote sometimes starts before `post-fs-data`) |
-| `service.sh` (watcher) | camera app namespace | cosmetic: keeps the file consistent for code that opens the jar later |
+| `com.oplus.camera.unit.sdk.jar` | NoMount rule: `/product/framework/…jar` → `<module>/product/framework/…jar` | survives the per-app mount namespace |
+| OEM `oat/arm64/com.oplus.camera.unit.sdk.{odex,vdex}` | NoMount rules to **zero-length** files | the OEM artifacts were compiled from the *stock* jar; ART must be forced to extract the dex from ours |
+| `oplus-framework.jar` (thermal) | bind mount, created in `post-fs-data.sh` **before** the zygote starts | it is a **bootclasspath** jar: the zygote opens it once at boot and keeps it mapped, so the mount only has to exist at that moment |
 
-**How to tell whether the patched classes are actually loaded** — compare the
-dex signature that ART has in memory with the patched jar:
+The module **ships the redirect tree itself**:
+
+```
+/data/adb/modules/ocam_camfix/
+├── SDK-PATCHED.jar                                  # source of truth
+└── product/framework/
+    ├── com.oplus.camera.unit.sdk.jar                # the patched jar
+    └── oat/arm64/com.oplus.camera.unit.sdk.{odex,vdex}   # empty
+```
+
+NoMount's `metamount.sh` walks every module's `product/` tree at boot and
+injects these rules automatically, before the zygote and before any app
+starts. `post-fs-data.sh` adds them again (idempotent) and verifies the
+result; `service.sh` re-verifies every 10 seconds and repairs a lost rule —
+and notifies you if it ever cannot.
+
+**How to tell whether the patched classes are actually loaded** — one command:
 
 ```bash
+adb shell su -c 'stat -Lc %s /product/framework/com.oplus.camera.unit.sdk.jar'
+# patched jar = 4946456      (the OEM stock jar is 4926415)
+adb shell su -c 'stat -Lc %s /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex'
+# 0                          (the OEM prebuilt artifact is masked)
+
 adb shell su -c 'grep camera.unit.sdk /proc/$(pidof com.oplus.camera)/maps'
-adb shell su -c 'dd if=/proc/$(pidof com.oplus.camera)/mem bs=1 skip=<addr> count=48 | od -A n -t x1'
+# must show  [anon:dalvik-classes.dex extracte... /product/framework/com.oplus.camera.unit.sdk.jar]
+# if it shows  /product/framework/com.oplus.camera.unit.sdk.jar  as a FILE, the redirect is missing
+```
+
+You can also compare the dex signature ART has in memory with the patched jar:
+
+```bash
+adb shell su -c 'dd if=/proc/$(pidof com.oplus.camera)/mem bs=1 skip=<addr+12> count=32 | od -A n -t x1'
 #   bytes 12..32 of the dex header are the SHA-1 signature:
 #   patched  = 31 47 cd 68 66 09 ea c5 54 a0 47 76 4e 1c ac 76 29 4b ca ae 3b f8 77 81
 #   original = 36 cc f9 11 85 50 21 90 d3 07 51 95 eb e9 10 6f 5d 7b ed 2d 54 2b
 ```
 
-If the memory shows the *original* signature, the mount did not reach the
-zygote namespace and the camera is still running stock code.
+Details and the full investigation: **[docs/VFS-REDIRECT.md](docs/VFS-REDIRECT.md)**.
 
 ---
 
@@ -340,23 +360,30 @@ Full matrix: **[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)**.
 |---|---|
 | `setenforce 0` (permissive SELinux) | MediaTek's **MKP** integrity module hashes the SELinux state and panics the kernel → black screen, reboot loop. This is what caused the very first crash in this investigation. |
 | Run frida / frida-server | it writes an SELinux policy to the kernel → same MKP panic |
-| `chcon` / `setfattr` / `setenforce` from a **boot-time** script | same MKP panic. **This module therefore sets the SELinux label exactly once, at install time**, and its boot scripts do nothing but `mount --bind`. |
-| Bind-mount over `/product/...` with the wrong label | the camera app cannot read the jar → `NoClassDefFoundError`, instant crash. The jar keeps the `system_file` label the original had. |
+| `chcon` / `setfattr` / `setenforce` from a **boot-time** script | same MKP panic. **This module therefore sets the SELinux label exactly once, at install time**; its boot scripts only create one `mount --bind` and the NoMount redirect rules. |
+| Bind-mount over `/product/...` with the wrong label | the camera app cannot read the jar → `NoClassDefFoundError`, instant crash. The jar (and the copy NoMount redirects to) keeps the `system_file` label the original had. |
 
 > Note: on this device MKP also panics continuously from unrelated modules
 > (`zygisk_vector`, `rezygisk`, …). If `dmesg | grep policy_action_panic` is
 > already counting up while the patch is disabled, that is **not** the patch.
 
-### The module's own safety rails
+### Requirements
 
-The boot scripts are deliberately paranoid — they only ever do a `mount --bind`,
-and only when everything checks out:
+* **KernelSU** (or KernelSU Next) with the **NoMount** metamodule
+  (`id=nomount`, v2.1+) — that is the kernel VFS redirect the SDK jar is
+  delivered through. The module detects it and tells you if it is missing.
+* No reboot-loop risk from mounts: the module creates **one** bind mount (the
+  bootclasspath thermal jar) through an inode-checked `bind_once()` with a hard
+  cap of 4. There is no mount loop anywhere.
+
+### The module's own safety rails
 
 | Guard | What it prevents |
 |---|---|
-| the patched jar must be complete (recorded size, or zip magic) | mounting a truncated / half-written file over the real SDK |
-| the SDK on disk must be byte-identical (sha256) to the copy the jar was built from | flashing the release zip onto a device with different firmware, or an OTA silently replacing a newer SDK with an older one |
-| already-mounted check (via `/proc/self/mountinfo`) | stacking mounts |
+| the patched jar must be complete (recorded size) | redirecting to a truncated / half-written file |
+| the effective path is **re-checked every 10 s** (`stat -Lc %s` = our size, vdex = 0) | a lost redirect silently running the stock SDK |
+| the user is **notified** when the redirect cannot be repaired | a silent "shutter does nothing" |
+| inode-checked `bind_once()` + hard mount cap | stacking mounts (a development build once filled the table and crashed the phone) |
 | every path exits 0 | the module can never fail a boot |
 
 `tools/test_boot_guards.sh` runs these guards against a simulated filesystem:
@@ -378,16 +405,17 @@ install.sh                   patch both jars + install + reboot  (device side)
 uninstall.sh                 rollback
 ksu-module/
   module.prop                KernelSU module metadata
-  post-fs-data.sh            boot-time bind mounts (init + zygote namespace)
-  service.sh                 zygote-namespace watcher + volume-key switch
-                             + camera-spin watchdog
+  post-fs-data.sh            NoMount redirect rules + the thermal bind mount
+  service.sh                 redirect watcher (repairs + notifies) + volume-key
+                             switch + camera-spin watchdog
+  boot-completed.sh          keeps the watcher alive, final verification
+  product/framework/…        the redirect tree NoMount injects at boot
   sepolicy.rule              lets the camera write its private log to /data/vendor
 tools/
   patch_sdk.py               applies the three fixes to a decoded smali tree
   dexfp.py                   dex reader: inventory / fingerprint / compare
   analyze_sdk_skew.py        finds API skew between an APK and the device SDK
   build_release.sh           packages the flashable module zip
-  build_thermalfix_zip.sh    packages the optional thermal module zip
   build_framework_patch.sh   decode + patch + rebuild + verify the framework jar
   patch_thermal_bypass.py    patches the camera-only thermal bypass
   test_boot_guards.sh        simulates the boot-script safety guards

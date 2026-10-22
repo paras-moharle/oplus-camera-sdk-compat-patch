@@ -123,19 +123,23 @@ go away.
 
 ## 5. The patch is installed but the camera still cancels every capture
 
-Check that the **zygote** namespace really has the patched jar:
+Check that the **redirect** is in effect (it is namespace independent, so one
+command is enough):
 
 ```bash
-adb shell su -c 'nsenter -t $(pidof zygote64) -m -- md5sum /product/framework/com.oplus.camera.unit.sdk.jar'
-adb shell su -c 'md5sum /data/adb/modules/ocam_sdkfix/SDK-PATCHED.jar'
+adb shell su -c 'stat -Lc %s /product/framework/com.oplus.camera.unit.sdk.jar'   # 4946456 = patched
+adb shell su -c 'stat -Lc %s /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex'   # 0
+adb shell su -c '/data/adb/ksu/bin/nm rule list | grep camera.unit'
 ```
 
-The two hashes must be identical. If they are not, the mount lost the race
-against the zygote — see the mount-namespace section in the README.
+If the sizes are wrong, the rules are missing: the watcher re-adds them within
+10 s (check `/data/adb/modules/ocam_camfix/status.txt`). If NoMount itself is
+missing, nothing can deliver the jar — see `docs/VFS-REDIRECT.md`.
 
 Then check that the running app really loaded the patched classes (the dex
-signature in memory, section "The mount-namespace trap" in the README). If the
-app still shows the *original* signature, restart it:
+signature in memory, section "Why a bind mount cannot work" in the README). If
+the app still shows the *original* signature, it started while the redirect was
+missing — the watcher force-stops it in that case; reopen the camera:
 
 ```bash
 adb shell su -c 'am force-stop com.oplus.camera'

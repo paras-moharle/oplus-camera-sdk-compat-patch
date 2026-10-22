@@ -56,8 +56,21 @@ say "staging module files"
 cp "$MODDIR/module.prop"     "$STAGE/"
 cp "$MODDIR/post-fs-data.sh" "$STAGE/"
 cp "$MODDIR/service.sh"      "$STAGE/"
+cp "$MODDIR/boot-completed.sh" "$STAGE/"
 cp "$MODDIR/sepolicy.rule"   "$STAGE/"
 cp "$PATCHED_JAR"            "$STAGE/SDK-PATCHED.jar"
+
+# The NoMount redirect tree.  NoMount's metamount.sh runs at boot, walks every
+# module's product/ (and system/ etc.) tree and injects a kernel VFS rule that
+# maps the OEM path to the file here.  This is what makes the camera load the
+# patched jar in EVERY mount namespace - a bind mount is stripped from the
+# app's namespace and never reaches the camera.
+mkdir -p "$STAGE/product/framework/oat/arm64"
+cp "$PATCHED_JAR" "$STAGE/product/framework/com.oplus.camera.unit.sdk.jar"
+# Zero-length files: they hide the OEM's prebuilt dexopt artifacts, which were
+# compiled from the STOCK jar, so ART must extract the dex from our jar.
+: > "$STAGE/product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex"
+: > "$STAGE/product/framework/oat/arm64/com.oplus.camera.unit.sdk.odex"
 
 if [ -n "$ORIGINAL_JAR" ] && [ -f "$ORIGINAL_JAR" ]; then
   cp "$ORIGINAL_JAR" "$STAGE/SDK-ORIGINAL.jar"
@@ -77,7 +90,7 @@ if [ -f "$STAGE/PATCHED-ofw.jar" ]; then
   stat -c %s "$STAGE/PATCHED-ofw.jar" > "$STAGE/PATCHED-ofw.jar.size"
 fi
 
-chmod 755 "$STAGE/post-fs-data.sh" "$STAGE/service.sh"
+chmod 755 "$STAGE/post-fs-data.sh" "$STAGE/service.sh" "$STAGE/boot-completed.sh"
 
 say "zip: $OUTDIR/$MODID-$VERSION.zip"
 rm -f "$OUTDIR/$MODID-$VERSION.zip"
@@ -96,7 +109,8 @@ $(printf '\033[1;32m*** DONE ***\033[0m')
 
 Flash it in KernelSU Manager -> Modules -> Install from storage, then reboot.
 
-  adb shell su -c 'nsenter -t \$(pidof zygote64) -m -- md5sum /product/framework/com.oplus.camera.unit.sdk.jar'
+  adb shell su -c 'stat -Lc %s /product/framework/com.oplus.camera.unit.sdk.jar'
+        -> must print the size of the patched jar (not the OEM one)
 
   hold volume-down for 2 s  ->  toggle the thermal bypass
   hold volume-up   for 2 s  ->  show the state

@@ -2,18 +2,28 @@
 #
 # Oplus camera fix - service  (author: Paras Moharle)
 #
-# Three jobs:
+# Jobs:
 #
-#  1. Close the boot-time race for the SDK jar.  post-fs-data.sh mounts the
-#     patched jar into the zygote's mount namespace, but the zygote does not
-#     always start after post-fs-data (this phone runs a MediaTek MKP
-#     kernel-panic storm, load average 20+, and the zygote is sometimes
-#     early).  This watcher mounts it as soon as the zygote is there.
+#  1. Keep the SDK redirect alive and PROVE it is alive.
+#
+#     The camera loads com.oplus.camera.unit.sdk.jar from /product/framework.
+#     The module redirects that path in the kernel (NoMount "nm" rules, see
+#     post-fs-data.sh), so every process - in every mount namespace - opens
+#     the patched jar.  This watcher checks the redirect every 10 seconds:
+#
+#         stat /product/framework/com.oplus.camera.unit.sdk.jar
+#
+#     must report OUR size, and the OEM's prebuilt .vdex must report 0 bytes.
+#     If it does not (rule lost, NoMount reloaded, metamodule updated, jar
+#     replaced), the rules are re-applied at once.
+#
+#     If it cannot be repaired, the user gets a notification - the camera
+#     must never silently fall back to the stock SDK and cancel captures.
 #
 #  2. The volume key toggle for the thermal bypass.
 #
-#        hold volume-down for 2 s   ->  toggle the thermal bypass
-#        hold volume-up   for 2 s   ->  show the current state
+#         hold volume-down for 2 s   ->  toggle the thermal bypass
+#         hold volume-up   for 2 s   ->  show the current state
 #
 #     The bypass is a system property that the patched
 #     OplusHoraeThermalHelper reads on every call, so the change is effective
@@ -30,20 +40,31 @@
 #
 # SAFETY
 # ------
+# * The module creates ONE bind mount (the bootclasspath thermal jar), through
+#   an inode-checked bind_once() with a hard cap.  There is no mount loop.
 # * Only "mount --bind", "setprop" and "getevent" are used.  No chcon /
 #   setfattr / setenforce: the MKP kernel-integrity module panics the kernel
 #   if the SELinux state changes while the system boots.
 # * Every failure path exits 0.  This script can never fail a boot.
-# * It never restarts or kills any app.
+# * It never touches an app, with one exception: if the redirect really was
+#   lost while the camera was running (that process keeps the stock classes
+#   and would ignore every shutter press), the camera is force-stopped so the
+#   next launch loads the patched SDK again.  The user is told.
+
+PATH=/system/bin:/system/xbin:/vendor/bin:/bin:/sbin:$PATH
+export PATH
 
 MODDIR=/data/adb/modules/ocam_camfix
 SDK_SRC="$MODDIR/SDK-PATCHED.jar"
+SDK_REDIR="$MODDIR/product/framework/com.oplus.camera.unit.sdk.jar"
+OAT_REDIR="$MODDIR/product/framework/oat/arm64"
 SDK_TGT=/product/framework/com.oplus.camera.unit.sdk.jar
-OAT_DIR=/product/framework/oat/arm64
+OAT_TGT=/product/framework/oat/arm64
+OFW_SRC="$MODDIR/PATCHED-ofw.jar"
+OFW_TGT=/system/framework/oplus-framework.jar
 DEX_CACHE=/data/dalvik-cache/arm64/product@framework@com.oplus.camera.unit.sdk.jar
-PF="$MODDIR/pf"
-PF_JAR="$PF/com.oplus.camera.unit.sdk.jar"
 PROP=persist.oplus.camera.thermal_bypass
+LOG="$MODDIR/status.txt"
 
 [ -f "$SDK_SRC" ] || exit 0
 
@@ -52,96 +73,22 @@ if [ "$(getprop $PROP)" = "" ]; then
   setprop $PROP 1
 fi
 
-# An empty file used to invalidate the OEM's prebuilt artifacts (.odex and
-# .vdex) for the SDK jar, so that ART can never fall back to the stock
-# compiled code.
-[ -f "$MODDIR/empty.bin" ] || : > "$MODDIR/empty.bin" 2>/dev/null
+SDK_SZ=$(stat -c %s "$SDK_SRC" 2>/dev/null)
+[ -n "$SDK_SZ" ] || exit 0
 
-# make sure the replacement directory for /product/framework exists and holds
-# the patched jar and no prebuilt artifacts.  /product/framework is an
-# OverlayFS, and ART opens the SDK jar through it - the overlay pins the
-# dentry, so a bind mount over the jar is ignored.  Replacing the whole
-# overlay with a plain directory is the only thing that works.
-build_pf_dir() {
-  if [ ! -f "$PF_JAR" ]; then
-    rm -rf "$PF" 2>/dev/null
-    mkdir -p "$PF" 2>/dev/null
-    cp -a /product/framework/. "$PF/" 2>/dev/null
-  fi
-  cp -f "$SDK_SRC" "$PF_JAR" 2>/dev/null
-  for f in "$PF/oat/arm64/com.oplus.camera.unit.sdk.vdex" "$PF/oat/arm64/com.oplus.camera.unit.sdk.odex"; do
-    [ -e "$f" ] && : > "$f" 2>/dev/null
-  done
-}
+# Record the PID so install.sh / uninstall.sh / boot-completed.sh can find and
+# stop this watcher.  Pattern-matching ("pkill -f .../service.sh") is not used:
+# it would also match the shell that is running the pkill itself.
+echo $$ > "$MODDIR/service.pid" 2>/dev/null
 
-# bind_once <source> <target> [namespace]
-#
-# NEVER stack a mount.  A mount on a path that is already mounted creates a
-# NEW mount on top of it, and repeating that in a loop fills the mount table
-# until the kernel gives up - which is exactly what crashed the phone once.
-# So the target is always checked first, in the namespace it is going to be
-# created in.
-MOUNTS_MADE=0
-MOUNT_CAP=16
+say() { log -t ocam_camfix "$*"; }
+record() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG" 2>/dev/null; }
 
-# Is $SRC already mounted at $TGT (in the namespace $NS, or the current one)?
-#
-# The check has to compare the INODE, not just the path: /product/framework is
-# already a mount (the OEM's OverlayFS), so a path-only check would wrongly
-# conclude "already done" and never mount our replacement directory.
-# Comparing the device+inode of the source with the device+inode that the
-# target resolves to tells us whether *our* file is already there.
-already_ours() {
-  SRC="$1"; TGT="$2"; NS="$3"
-  if [ -n "$NS" ]; then
-    A=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$SRC" 2>/dev/null)
-    B=$(nsenter -t "$NS" -m -- stat -Lc "%d:%i" "$TGT" 2>/dev/null)
-  else
-    A=$(stat -Lc "%d:%i" "$SRC" 2>/dev/null)
-    B=$(stat -Lc "%d:%i" "$TGT" 2>/dev/null)
-  fi
-  [ -n "$A" ] && [ -n "$B" ] && [ "$A" = "$B" ]
-}
-
-bind_once() {
-  SRC="$1"; TGT="$2"; NS="$3"
-  [ -e "$TGT" ] || return 0
-  already_ours "$SRC" "$TGT" "$NS" && return 0
-
-  # Hard cap.  The module may create a handful of mounts, never more.  If the
-  # counter goes over the cap something is looping, and the module takes
-  # itself out of the game instead of filling the mount table.
-  if [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ]; then
-    say "ABORT: the mount cap ($MOUNT_CAP) is reached - disabling the module"
-    touch "$MODDIR/disable" 2>/dev/null
-    exit 0
-  fi
-
-  if [ -n "$NS" ]; then
-    nsenter -t "$NS" -m -- mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
-  else
-    mount --bind "$SRC" "$TGT" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE+1))
-  fi
-}
-
-mask_prebuilt() {
-  # $1 = the namespace to work in ("" = the current one)
-  NS="$1"
-  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
-    bind_once "$MODDIR/empty.bin" "$OAT_DIR/$f" "$NS"
-  done
-}
-
-# ------------------------------------------------------------------ helpers
-
-# ART keeps the dexopt output of the SDK jar in /data/dalvik-cache.  If that
-# cache was built from the STOCK jar, ART keeps using it (and the camera
-# keeps cancelling every capture), so it has to be dropped whenever the mount
-# is (re)applied.  The next app that starts then dexopts the jar that is
-# really mounted - ours.
-clear_dex_cache() {
-  rm -f "$DEX_CACHE"@classes.vdex 2>/dev/null
-  rm -f "$DEX_CACHE"@classes.dex 2>/dev/null
+# Post a short notification so the user sees what happened.  Falls back to
+# the log if the notification service refuses the post.
+notify() {
+  say "$1: $2"
+  cmd notification post "$1" "$2" >/dev/null 2>&1 || true
 }
 
 now_ms() {
@@ -149,18 +96,102 @@ now_ms() {
   awk '{printf "%d", $1 * 1000}' /proc/uptime 2>/dev/null
 }
 
-say() {
-  log -t ocam_camfix "$*"
+# ------------------------------------------------------------------- redirect
+NM=""
+for c in "$MODDIR/../nomount/bin/nm" /data/adb/ksu/bin/nm /data/adb/ap/bin/nm nm; do
+  if command -v "$c" >/dev/null 2>&1; then NM="$c"; break; fi
+done
+
+add_rules() {
+  [ -n "$NM" ] || return 1
+  "$NM" rule add "$SDK_TGT" "$SDK_REDIR" >/dev/null 2>&1 || return 1
+  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+    "$NM" rule add "$OAT_TGT/$f" "$OAT_REDIR/$f" >/dev/null 2>&1 || return 1
+  done
+  return 0
 }
 
-# Post a short notification so the user sees what happened.  Falls back to
-# the log if the notification service refuses the post.
-notify() {
-  TITLE="$1"; TEXT="$2"
-  say "$TITLE: $TEXT"
-  cmd notification post "$TITLE" "$TEXT" >/dev/null 2>&1 || true
+# Never leave the OEM prebuilt vdex masked while the jar is still the stock one:
+# ART then trusts a zero-length dex file for the stock jar, fails to resolve
+# every SDK class and the camera dies at launch with NoClassDefFoundError
+# (CameraAdapterUtils).  A broken-but-open camera is better than a crash, and
+# the next add_rules() puts the real jar in place first.
+demask_if_inconsistent() {
+  [ -n "$NM" ] || return 0
+  SZ=$(stat -Lc %s "$SDK_TGT" 2>/dev/null)
+  [ "$SZ" = "$SDK_SZ" ] && return 0
+  VZ=$(stat -Lc %s "$OAT_TGT/com.oplus.camera.unit.sdk.vdex" 2>/dev/null)
+  [ "$VZ" = "0" ] || return 0
+  say "inconsistent state (stock jar + masked vdex) - unmasking the OEM dex first"
+  for f in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+    "$NM" rule del "$OAT_TGT/$f" >/dev/null 2>&1 || true
+  done
+  record "service: unmasked the OEM vdex/odex to avoid a camera crash"
 }
 
+# The redirect is in effect when the OEM path reports our jar and the OEM
+# prebuilt vdex is hidden behind a zero-length file.
+redirect_ok() {
+  SZ=$(stat -Lc %s "$SDK_TGT" 2>/dev/null)
+  VZ=$(stat -Lc %s "$OAT_TGT/com.oplus.camera.unit.sdk.vdex" 2>/dev/null)
+  [ "$SZ" = "$SDK_SZ" ] && [ "$VZ" = "0" ]
+}
+
+# Drop a dalvik-cache entry that may have been built from the stock jar.
+clear_dex_cache() {
+  rm -f "$DEX_CACHE"@classes.vdex 2>/dev/null
+  rm -f "$DEX_CACHE"@classes.dex 2>/dev/null
+}
+
+# The redirect target must still be the patched jar.  A truncated file (disk
+# error, interrupted copy, an OTA that rewrote the module dir) would be
+# redirected to just as happily as the good one, so check and repair it.
+target_ok() {
+  SZ=$(stat -c %s "$SDK_REDIR" 2>/dev/null)
+  [ "$SZ" = "$SDK_SZ" ] && return 0
+  cp -f "$SDK_SRC" "$SDK_REDIR" 2>/dev/null
+  [ "$(stat -c %s "$SDK_REDIR" 2>/dev/null)" = "$SDK_SZ" ]
+}
+
+# Stop the camera when it may have loaded the STOCK sdk.  ART extracts the dex
+# once, at process start: a process that began while the redirect was gone
+# keeps the broken classes until it is restarted, and its shutter does
+# nothing.  Restarting is the only recovery, and it is done only when the
+# redirect really was lost while the app was running.
+recover_camera() {
+  PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
+  [ -n "$PID" ] || return 0
+  am force-stop com.oplus.camera >/dev/null 2>&1 || return 0
+  record "service: camera was running with a broken redirect - force-stopped so it reloads the patched SDK"
+  notify "Oplus camera fix" "The camera fix was interrupted and has been restored. Reopen the camera."
+}
+
+# ------------------------------------------------------------- thermal mount
+MOUNTS_MADE=0
+MOUNT_CAP=4
+
+already_ours() {
+  A=$(stat -Lc "%d:%i" "$1" 2>/dev/null)
+  B=$(stat -Lc "%d:%i" "$2" 2>/dev/null)
+  [ -n "$A" ] && [ -n "$B" ] && [ "$A" = "$B" ]
+}
+
+bind_once() {
+  [ -e "$2" ] || return 0
+  already_ours "$1" "$2" && return 0
+  [ "$MOUNTS_MADE" -ge "$MOUNT_CAP" ] && return 0
+  mount --bind "$1" "$2" 2>/dev/null && MOUNTS_MADE=$((MOUNTS_MADE + 1))
+}
+
+# Keep the bootclasspath mount in place even if something unmounted it: the
+# zygote already has the patched class, but cameraserver / a restarted media
+# stack may open the jar again.
+keep_thermal_mount() {
+  [ -f "$OFW_SRC" ] || return 0
+  bind_once "$OFW_SRC" "$OFW_TGT"
+}
+
+# ------------------------------------------------------------------ volume keys
 thermal_state() {
   S=$(getprop $PROP)
   [ "$S" = "0" ] && S=1 || S=0
@@ -173,11 +204,7 @@ thermal_state() {
 
 toggle_thermal() {
   S=$(getprop $PROP)
-  if [ "$S" = "0" ]; then
-    NEW=1
-  else
-    NEW=0
-  fi
+  if [ "$S" = "0" ]; then NEW=1; else NEW=0; fi
   setprop $PROP "$NEW"
   if [ "$NEW" = "1" ]; then
     notify "Oplus camera fix" "Thermal bypass ON - the camera no longer waits for the phone to cool down"
@@ -205,8 +232,7 @@ show_thermal() {
 #
 #   /dev/input/event7: 0001 0073 00000001
 #   0001 0073 00000001
-#   0001 0073 00000001   (EV_KEY, KEY_VOLUMEDOWN, DOWN)
-#
+#   EV_KEY KEY_VOLUMEDOWN DOWN
 handle_key() {
   LINE="$1"
   case "$LINE" in /dev/input/*) LINE="${LINE#*: }" ;; esac
@@ -269,34 +295,6 @@ key_watch() {
   done
 }
 
-# ------------------------------------------------------- self-protection
-#
-# The mount table is a finite resource.  A loop that binds the same path over
-# and over filled it with 6146 stacked mounts once and took the phone down.
-# bind_once() prevents that, but as a last resort this watcher watches the
-# mount count of every path it touches: if it is ever more than one, the
-# extra mounts are removed and the module disables ITSELF, so a mistake can
-# never take the phone down again.
-mount_count() {
-  awk '{print $5}' /proc/self/mountinfo 2>/dev/null | grep -c "^$1$"
-}
-
-sanity_check_mounts() {
-  for t in "$SDK_TGT" "$OAT_DIR/com.oplus.camera.unit.sdk.vdex" "$OAT_DIR/com.oplus.camera.unit.sdk.odex"; do
-    c=$(mount_count "$t")
-    if [ "${c:-0}" -gt 1 ]; then
-      say "ABORT: $t has $c stacked mounts - removing the extras and disabling the module"
-      while [ "$c" -gt 1 ]; do
-        umount "$t" 2>/dev/null || break
-        c=$((c - 1))
-      done
-      touch "$MODDIR/disable" 2>/dev/null
-      say "the module has been disabled - reboot to be safe"
-      exit 0
-    fi
-  done
-}
-
 # ----------------------------------------------------------------- watchdog
 SPIN_ACC=0
 SPIN_N=0
@@ -340,66 +338,74 @@ watchdog_camera_spin() {
 # --------------------------------------------------------------------- main
 key_watch &
 KEYPID=$!
+echo "$KEYPID" > "$MODDIR/service.keypid" 2>/dev/null
 
-LAST_Z=""
-LAST_PID=""
-WATCH_N=0
+# Kill the key reader as well, or it would stay behind as an orphan and keep
+# reading /dev/input after this watcher is stopped.
+trap 'kill $KEYPID $(cat /proc/$KEYPID/task/$KEYPID/children 2>/dev/null) 2>/dev/null; rm -f "$MODDIR/service.pid" "$MODDIR/service.keypid" 2>/dev/null; exit 0' TERM INT
+
+# The first check happens immediately: post-fs-data may have run before
+# NoMount finished loading.  For the first minute the check runs on EVERY
+# iteration (twice a second), so a rule that is lost during boot is caught
+# before the user can open the camera.
+add_rules
+target_ok
+if redirect_ok; then
+  record "service: SDK redirect active ($(stat -Lc %s "$SDK_TGT") bytes)"
+else
+  record "service: SDK redirect NOT effective yet (nm=$NM)"
+fi
+clear_dex_cache
+keep_thermal_mount
+
+FAIL_N=0
+LAST_NOTIFY=0
+N=0
+WAS_OK=1
 
 while true; do
-  # --- the zygote: the important one -------------------------------------
-  Z=""
-  for p in $(pidof zygote64 2>/dev/null) $(pidof zygote 2>/dev/null); do
-    Z="$p"
-    break
-  done
-
-  # The mount is checked, not just tracked by PID: the zygote namespace can
-  # lose the mount (a late `umount`, a remount of /product, ...) and the
-  # camera would silently fall back to the stock jar - and to the OEM's
-  # prebuilt artifact compiled from it.
-  if [ -n "$Z" ]; then
-    if [ "$Z" != "$LAST_Z" ]; then
-      LAST_Z="$Z"
-      build_pf_dir
-      bind_once "$PF" /product/framework "$Z"
-      bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
-      mask_prebuilt "$Z"
+  # the redirect: cheap stat twice a second during boot, then every 10 s
+  if [ "$N" -lt 120 ] || [ $((N % 20)) -eq 0 ]; then
+    if ! redirect_ok; then
+      say "the SDK redirect was lost - re-applying"
+      WAS_OK=0
+      target_ok
+      demask_if_inconsistent
+      add_rules
       clear_dex_cache
-    elif [ $((WATCH_N % 4)) -eq 0 ]; then
-      if ! nsenter -t "$Z" -m -- awk '{print $5}' /proc/self/mountinfo 2>/dev/null \
-           | grep -qx "$SDK_TGT"; then
-        say "the zygote namespace lost the patched jar - restoring it"
-        bind_once "$SDK_SRC" "$SDK_TGT" "$Z"
-        mask_prebuilt "$Z"
-        # ART caches the dexopt output in /data/dalvik-cache.  If that cache
-        # was built from the stock jar it would keep being used, so it has to
-        # go - the next app that starts then dexopts the jar that is really
-        # mounted (ours).
-        clear_dex_cache
+      if redirect_ok; then
+        record "service: SDK redirect restored"
+        # A camera process that started while the redirect was gone loaded the
+        # stock classes and would ignore every shutter press.  Restart it.
+        recover_camera
+        FAIL_N=0
+      else
+        FAIL_N=$((FAIL_N + 1))
+        record "service: SDK redirect still broken (attempt $FAIL_N, nm=$NM)"
+        # tell the user, at most once every 10 minutes
+        NOW=$(date +%s 2>/dev/null)
+        [ -n "$NOW" ] || NOW=0
+        if [ $((NOW - LAST_NOTIFY)) -ge 600 ]; then
+          LAST_NOTIFY=$NOW
+          if [ -z "$NM" ]; then
+            notify "Oplus camera fix" "Camera fix INACTIVE: the NoMount (nm) metamodule is missing. The camera will cancel captures."
+          else
+            notify "Oplus camera fix" "Camera fix INACTIVE: the patched SDK is not being loaded. See /data/adb/modules/ocam_camfix/status.txt"
+          fi
+        fi
+      fi
+    else
+      FAIL_N=0
+      if [ "$WAS_OK" = "0" ]; then
+        WAS_OK=1
+        record "service: redirect healthy again"
       fi
     fi
-    WATCH_N=$((WATCH_N + 1))
+    keep_thermal_mount
   fi
 
-  # --- init namespace (in case it was lost) ------------------------------
-  build_pf_dir
-  bind_once "$PF" /product/framework ""
-  bind_once "$SDK_SRC" "$SDK_TGT" ""
-  mask_prebuilt ""
-
-  # --- the camera app's own namespace (cosmetic) -------------------------
-  PID=$(pidof com.oplus.camera 2>/dev/null | awk '{print $1}')
-  if [ -n "$PID" ] && [ "$PID" != "$LAST_PID" ]; then
-    bind_once "$PF" /product/framework "$PID"
-    bind_once "$SDK_SRC" "$SDK_TGT" "$PID"
-    mask_prebuilt "$PID"
-    LAST_PID="$PID"
-  fi
-
-  sanity_check_mounts
-
+  N=$((N + 1))
   sleep 0.5
-
   watchdog_camera_spin
 done
 

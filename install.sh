@@ -228,6 +228,16 @@ drun "chcon $ORIG_CTX $KSU_DIR/SDK-ORIGINAL.jar" 2>/dev/null || true
 drun "chcon $OFW_CTX $KSU_DIR/PATCHED-ofw.jar" 2>/dev/null || true
 say "labels set to $ORIG_CTX / $OFW_CTX (install time only, never at boot)"
 
+# The file that NoMount redirects the OEM path to lives in the module's
+# product/ tree.  It has to carry the same label as the original jar - the
+# camera reads it through the redirect, from the untrusted_app domain.
+drun "mkdir -p $KSU_DIR/product/framework/oat/arm64"
+drun "cp -f $KSU_DIR/SDK-PATCHED.jar $KSU_DIR/product/framework/com.oplus.camera.unit.sdk.jar"
+drun ": > $KSU_DIR/product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex"
+drun ": > $KSU_DIR/product/framework/oat/arm64/com.oplus.camera.unit.sdk.odex"
+drun "chcon $ORIG_CTX $KSU_DIR/product/framework/com.oplus.camera.unit.sdk.jar" 2>/dev/null || true
+drun "chmod 755 $KSU_DIR/product/framework/com.oplus.camera.unit.sdk.jar" 2>/dev/null || true
+
 # Record the exact size of the patched jar.  The boot scripts compare it
 # against the file before bind-mounting it, so a truncated / partially written
 # jar can never shadow the real SDK.
@@ -239,12 +249,14 @@ drun "sha256sum $KSU_DIR/PATCHED-ofw.jar | cut -d' ' -f1 > $KSU_DIR/PATCHED-ofw.
 adb push "$SCRIPT_DIR/ksu-module/module.prop"     "$KSU_DIR/module.prop.tmp"     >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/post-fs-data.sh" "$KSU_DIR/post-fs-data.sh.tmp" >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/service.sh"      "$KSU_DIR/service.sh.tmp"      >/dev/null
+adb push "$SCRIPT_DIR/ksu-module/boot-completed.sh" "$KSU_DIR/boot-completed.sh.tmp" >/dev/null
 adb push "$SCRIPT_DIR/ksu-module/sepolicy.rule"   "$KSU_DIR/sepolicy.rule.tmp"   >/dev/null
 drun "mv $KSU_DIR/module.prop.tmp $KSU_DIR/module.prop"
 drun "mv $KSU_DIR/post-fs-data.sh.tmp $KSU_DIR/post-fs-data.sh"
 drun "mv $KSU_DIR/service.sh.tmp $KSU_DIR/service.sh"
+drun "mv $KSU_DIR/boot-completed.sh.tmp $KSU_DIR/boot-completed.sh"
 drun "mv $KSU_DIR/sepolicy.rule.tmp $KSU_DIR/sepolicy.rule"
-drun "chmod 755 $KSU_DIR/post-fs-data.sh $KSU_DIR/service.sh"
+drun "chmod 755 $KSU_DIR/post-fs-data.sh $KSU_DIR/service.sh $KSU_DIR/boot-completed.sh"
 drun "chmod 644 $KSU_DIR/sepolicy.rule"
 
 say "module installed:"
@@ -253,20 +265,42 @@ drun "ls -l $KSU_DIR" | sed 's/^/  /'
 # Apply the patch immediately so the user does not have to wait for a reboot.
 # The module will re-apply it at every subsequent boot.
 #
-# The mount has to land in the ZYGOTE's mount namespace: ART extracts
-# classes.dex from the jar when an app process starts, so a mount that only
-# exists in the init namespace (or that appears after the app was forked)
-# has no effect at all - the app silently keeps the stock classes.
+# The patch is a VFS path redirect (NoMount "nm" rule), not a mount: every
+# app process gets a fresh mount namespace in which bind mounts are stripped,
+# so a mount is never seen by the camera.  The redirect is namespace
+# independent and is injected by NoMount at boot from the module's
+# product/ tree; here it is applied by hand once, for this running boot.
 say "applying the patch now (the module re-applies it at every boot)"
-drun "mount --bind $KSU_DIR/SDK-PATCHED.jar $DEVICE_JAR" 2>/dev/null || true
-for Z in $(drun "pidof zygote64" 2>/dev/null) $(drun "pidof zygote" 2>/dev/null); do
-  drun "nsenter -t $Z -m -- mount --bind $KSU_DIR/SDK-PATCHED.jar $DEVICE_JAR" 2>/dev/null || true
-  break
+NM=""
+for CAND in /data/adb/ksu/bin/nm /data/adb/ap/bin/nm nm; do
+  if drun "command -v $CAND" 2>/dev/null | grep -q .; then NM="$CAND"; break; fi
 done
-if drun "nsenter -t \$(pidof zygote64 | cut -d' ' -f1) -m -- md5sum $DEVICE_JAR" 2>/dev/null | grep -q .; then
-  say "patch is live in the zygote namespace - no reboot strictly required"
+if [ -n "$NM" ]; then
+  drun "$NM rule add $DEVICE_JAR $KSU_DIR/product/framework/com.oplus.camera.unit.sdk.jar" 2>/dev/null || true
+  for F in com.oplus.camera.unit.sdk.vdex com.oplus.camera.unit.sdk.odex; do
+    drun "$NM rule add /product/framework/oat/arm64/$F $KSU_DIR/product/framework/oat/arm64/$F" 2>/dev/null || true
+  done
+  LIVE_SZ=$(drun "stat -Lc %s $DEVICE_JAR" 2>/dev/null | tr -d '\r')
+  WANT_SZ=$(drun "stat -c %s $KSU_DIR/SDK-PATCHED.jar" 2>/dev/null | tr -d '\r')
+  if [ -n "$LIVE_SZ" ] && [ "$LIVE_SZ" = "$WANT_SZ" ]; then
+    say "patch is live (the OEM path now resolves to the patched jar) - no reboot required"
+  else
+    warn "the redirect is not effective yet (live=$LIVE_SZ want=$WANT_SZ) - a reboot is required"
+  fi
+
+  # A camera that is already running keeps the classes it loaded at start.
+  if drun "pidof com.oplus.camera" 2>/dev/null | grep -q .; then
+    say "restarting the camera so it reloads the patched SDK"
+    drun "am force-stop com.oplus.camera" >/dev/null 2>&1 || true
+  fi
+
+  # (Re)start the watcher; boot-completed.sh keeps it alive afterwards.
+  drun "for f in $KSU_DIR/service.pid $KSU_DIR/service.keypid; do [ -f \$f ] && kill \$(cat \$f) 2>/dev/null; done; true" >/dev/null 2>&1 || true
+  drun "setsid sh /data/adb/modules/ocam_camfix/service.sh >/dev/null 2>&1 < /dev/null &" >/dev/null 2>&1 || true
+  drun "chmod 755 $KSU_DIR/boot-completed.sh" >/dev/null 2>&1 || true
 else
-  warn "could not apply the bind mount to the zygote namespace, a reboot is required"
+  warn "NoMount (nm) was not found - the camera fix cannot work without it"
+  warn "install the NoMount metamodule, then reboot"
 fi
 
 # The framework jar is a BOOTCLASSPATH jar: the zygote opens it once at boot

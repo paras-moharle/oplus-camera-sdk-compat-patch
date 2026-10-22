@@ -41,6 +41,27 @@ say "unmounting any active overlay"
 drun "umount $TARGET" 2>/dev/null || true
 drun "umount $FW_TARGET" 2>/dev/null || true
 
+# Stop the watcher first, or it would re-apply the rules it owns.
+drun "for f in $KSU_DIR/service.pid $KSU_DIR/service.keypid; do [ -f \$f ] && kill \$(cat \$f) 2>/dev/null; done; true" >/dev/null 2>&1 || true
+
+# The SDK patch is a kernel VFS redirect (NoMount), not a mount: drop the
+# rules, otherwise this running boot would keep serving the patched jar.
+#
+# Order matters: the masked OEM vdex is removed FIRST, then the jar.  A stock
+# jar with a masked vdex cannot resolve any SDK class and the camera crashes
+# at launch (NoClassDefFoundError: CameraAdapterUtils); stock jar + stock vdex
+# is the normal, working state.
+case "$(drun 'ls /data/adb/ksu/bin/nm 2>/dev/null')" in
+  */nm)
+    say "removing the NoMount redirect rules"
+    for P in /product/framework/oat/arm64/com.oplus.camera.unit.sdk.vdex \
+             /product/framework/oat/arm64/com.oplus.camera.unit.sdk.odex \
+             "$TARGET"; do
+      drun "/data/adb/ksu/bin/nm rule del $P" >/dev/null 2>&1 || true
+    done
+    ;;
+esac
+
 say "removing KernelSU module $KSU_DIR"
 drun "rm -rf $KSU_DIR"
 
