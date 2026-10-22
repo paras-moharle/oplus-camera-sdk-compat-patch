@@ -135,9 +135,9 @@ If the two hashes match and a photo appears, the fix is live.
 ./uninstall.sh          # removes the module; both stock jars are restored untouched
 ```
 
-> The original file on disk is **never modified** — the patch is a bind mount.
-> `sha256sum /product/framework/com.oplus.camera.unit.sdk.jar` still shows the
-> pristine OEM hash after installing.
+> The original file on disk is **never modified** — the patch is a kernel VFS
+> redirect (and, for the thermal jar, a bind mount). `sha256sum` of the OEM
+> files still shows the pristine hashes after installing.
 >
 > If your device has a KernelSU **metamodule with a custom installer** active,
 > it blocks `ksud module install` ("Metamodule installation blocked"). Use
@@ -317,8 +317,8 @@ dark env, flash-open trigger, lens-bag enable).
 | **Patch is hardware dependent?** | **No.** It is a Java type contract between two *firmware* components. No HAL, ISP, sensor or tuning data is touched. |
 | **Needs a matching camera APK?** | Yes — camera **6.070.215 or newer** against a **6.020.980-era** SDK. Both sides of that equation are firmware, not silicon. |
 | **Detection** | `grep -A6 KEY_PICTURE_EXIF_FLAG` in the decoded `producer/mode/BaseMode.smali` — if you see `check-cast v1, [I` right after the read, you need this. |
-| **Flashed on a *different* device?** | The module **verifies** that the SDK on disk is byte-identical to the SDK its jar was built from. On a different firmware it refuses to mount — your camera stays broken rather than getting an incompatible SDK. Use `./install.sh` instead: it rebuilds the patch from *that* device's own SDK. |
-| **After a ColorOS OTA** | **Disable the module.** An OTA ships a newer SDK. v1.2+ detects this automatically (the SDK hash no longer matches) and steps aside on its own. |
+| **Flashed on a *different* device?** | The jar is firmware specific. The module applies it unconditionally (there is no automatic fallback to the stock SDK), so on a different firmware the camera may misbehave instead of silently cancelling captures. Use `./install.sh` — it rebuilds the patch from *that* device's own SDK. |
+| **After a ColorOS OTA** | The redirect keeps serving the module's jar, so the camera keeps working — it just runs the older SDK. If the camera misbehaves after an OTA, rebuild with `./install.sh` (the new SDK is picked up automatically). The module deliberately does **not** step aside: falling back to the stock SDK would silently disable every capture. |
 
 ---
 
